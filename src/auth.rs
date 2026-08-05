@@ -212,10 +212,10 @@ pub fn refresh_expiry(resp: &AuthResponse) -> i64 {
     if let Some(n) = resp.refresh_expires.as_i64() {
         return n;
     }
-    if let Some(s) = resp.refresh_expires.as_str() {
-        if let Ok(n) = s.parse::<i64>() {
-            return n;
-        }
+    if let Some(s) = resp.refresh_expires.as_str()
+        && let Ok(n) = s.parse::<i64>()
+    {
+        return n;
     }
     match resp.refresh_ttl {
         Some(ttl) if ttl > 10 * 365 * 24 * 3600 => ttl as i64,

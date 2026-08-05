@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 pub const DEFAULT_API_BASE: &str = "https://api-std.sunlogin.oray.com";
@@ -41,8 +42,13 @@ pub struct Server {
 pub struct Config {
     pub account: Option<Account>,
     pub token: Option<Token>,
-    pub device: Option<Device>,
     pub client: Option<Client>,
+    /// Named plug registry: name -> device.
+    #[serde(default)]
+    pub plugs: HashMap<String, Device>,
+    /// Legacy single-device section, migrated into `plugs` on load.
+    #[serde(default, rename = "device", skip_serializing)]
+    pub legacy_device: Option<Device>,
     pub server: Option<Server>,
 }
 
@@ -61,7 +67,12 @@ impl Config {
             return Ok((Config::default(), p));
         }
         let raw = std::fs::read_to_string(&p).with_context(|| format!("read config {}", p.display()))?;
-        let cfg = toml::from_str(&raw).with_context(|| format!("parse config {}", p.display()))?;
+        let mut cfg: Config = toml::from_str(&raw).with_context(|| format!("parse config {}", p.display()))?;
+        if cfg.plugs.is_empty()
+            && let Some(dev) = cfg.legacy_device.take()
+        {
+            cfg.plugs.insert("default".to_string(), dev);
+        }
         Ok((cfg, p))
     }
 

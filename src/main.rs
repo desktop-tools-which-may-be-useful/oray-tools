@@ -11,7 +11,8 @@ use std::path::PathBuf;
 #[command(
     name = "oray-tools",
     version,
-    about = "oray-tools: control Oray smart plugs (login / refresh / on / off)"
+    about = "oray-tools: control Oray smart plugs",
+    after_help = "Run `oray-tools <COMMAND> --help` for command-specific options (e.g. `oray-tools login --help`)."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -20,6 +21,10 @@ struct Cli {
     /// Path to config file (default: $XDG_CONFIG_HOME/oray-tools/config.toml)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
+
+    /// Trusted Ex-ClientId (default: built-in trusted id)
+    #[arg(long, global = true)]
+    clientid: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -28,43 +33,54 @@ enum Command {
     Login {
         account: String,
         password: String,
-        /// Trusted Ex-ClientId (default: built-in trusted id)
-        #[arg(long)]
-        clientid: Option<String>,
-        /// Default device SN (optional, written to config)
-        #[arg(long)]
-        sn: Option<String>,
-        /// Default port index (optional, written to config)
-        #[arg(long, default_value_t = 0)]
-        index: usize,
     },
     /// Renew tokens with refresh_token and persist them
     Refresh,
     /// Show current token info and expiry
     Tokens,
+    /// Clear saved tokens and account
+    Logout,
+    /// Manage and control plugs
+    Plug {
+        #[command(subcommand)]
+        sub: PlugCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum PlugCmd {
+    /// List configured plugs
+    List,
+    /// Register a plug (name maps to a device SN)
+    Add {
+        name: String,
+        sn: String,
+        /// Default port index for this plug
+        #[arg(long, default_value_t = 0)]
+        index: usize,
+    },
+    /// Remove a configured plug
+    Remove { name: String },
     /// Query plug status
     Status {
-        #[arg(long)]
-        sn: Option<String>,
+        /// Plug name (defaults to `default` or the only configured plug)
+        name: Option<String>,
+        /// Port index (defaults to the plug's configured index)
         #[arg(long)]
         index: Option<usize>,
     },
     /// Turn the plug on
     On {
-        #[arg(long)]
-        sn: Option<String>,
+        name: Option<String>,
         #[arg(long)]
         index: Option<usize>,
     },
     /// Turn the plug off
     Off {
-        #[arg(long)]
-        sn: Option<String>,
+        name: Option<String>,
         #[arg(long)]
         index: Option<usize>,
     },
-    /// Clear saved tokens and account
-    Logout,
 }
 
 fn main() {
@@ -78,31 +94,25 @@ fn main() {
 fn run(cli: Cli) -> Result<()> {
     let (mut cfg, path) = Config::load(cli.config.as_ref())?;
     match cli.command {
-        Command::Login { account, password, clientid, sn, index } => {
-            do_login(&mut cfg, &path, &account, &password, clientid, sn, index)
-        }
-        Command::Refresh => do_refresh(&mut cfg, &path),
+        Command::Login { account, password } => do_login(&mut cfg, &path, cli.clientid.as_deref(), &account, &password),
+        Command::Refresh => do_refresh(&mut cfg, &path, cli.clientid.as_deref()),
         Command::Tokens => do_tokens(&cfg),
-        Command::Status { sn, index } => do_plug(&mut cfg, &path, sn, index, plug::PlugAction::Status),
-        Command::On { sn, index } => do_plug(&mut cfg, &path, sn, index, plug::PlugAction::On),
-        Command::Off { sn, index } => do_plug(&mut cfg, &path, sn, index, plug::PlugAction::Off),
         Command::Logout => do_logout(&mut cfg, &path),
+        Command::Plug { sub } => do_plug(&mut cfg, &path, sub),
     }
 }
 
-fn do_login(
-    cfg: &mut Config,
-    path: &PathBuf,
-    account: &str,
-    password: &str,
-    clientid: Option<String>,
-    sn: Option<String>,
-    index: usize,
-) -> Result<()> {
-    let cid = match clientid.or_else(|| cfg.client.as_ref().map(|c| c.clientid.clone())) {
-        Some(c) if !c.is_empty() => c,
-        _ => auth::DEFAULT_CLIENT_ID.to_string(),
-    };
+fn resolve_clientid(cfg: &Config, cli_clientid: Option<&str>) -> String {
+    cli_clientid
+        .filter(|c| !c.is_empty())
+        .or_else(|| cfg.client.as_ref().map(|c| c.clientid.as_str()))
+        .filter(|c| !c.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| auth::DEFAULT_CLIENT_ID.to_string())
+}
+
+fn do_login(cfg: &mut Config, path: &PathBuf, clientid: Option<&str>, account: &str, password: &str) -> Result<()> {
+    let cid = resolve_clientid(cfg, clientid);
     let server = cfg.server();
     let client = auth::standard_client()?;
     let terminal_name = hostname();
@@ -147,9 +157,6 @@ fn do_login(
         refresh_token: resp.refresh_token,
         refresh_expires: expiry,
     });
-    if let Some(sn) = sn {
-        cfg.device = Some(config::Device { sn, index });
-    }
     cfg.save(path)?;
     print_tokens(cfg);
     Ok(())
@@ -161,7 +168,7 @@ fn hostname() -> String {
         .unwrap_or_else(|_| "oray-tools".to_string())
 }
 
-fn do_refresh(cfg: &mut Config, path: &PathBuf) -> Result<()> {
+fn do_refresh(cfg: &mut Config, path: &PathBuf, clientid: Option<&str>) -> Result<()> {
     let token = cfg
         .token
         .as_ref()
@@ -169,13 +176,8 @@ fn do_refresh(cfg: &mut Config, path: &PathBuf) -> Result<()> {
     if token.refresh_token.is_empty() {
         bail!("no refresh token saved; run `oray-tools login` first");
     }
+    let cid = resolve_clientid(cfg, clientid);
     let server = cfg.server();
-    let cid = cfg
-        .client
-        .as_ref()
-        .map(|c| c.clientid.clone())
-        .filter(|c| !c.is_empty())
-        .unwrap_or_else(|| auth::DEFAULT_CLIENT_ID.to_string());
     let client = auth::standard_client()?;
     let resp = auth::refresh(&client, &server, &cid, &token.access_token, &token.refresh_token)?;
     let expiry = auth::refresh_expiry(&resp);
@@ -194,51 +196,109 @@ fn do_tokens(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-fn do_plug(cfg: &mut Config, path: &PathBuf, sn: Option<String>, index: Option<usize>, action: plug::PlugAction) -> Result<()> {
-    let default_index = cfg.device.as_ref().map(|d| d.index).unwrap_or(0);
-    let index = index.unwrap_or(default_index);
-    let sn = match sn.or_else(|| cfg.device.as_ref().map(|d| d.sn.clone())) {
-        Some(s) if !s.is_empty() => s,
-        _ => bail!("no SN; pass --sn or set a default device in config"),
-    };
+fn do_logout(cfg: &mut Config, path: &PathBuf) -> Result<()> {
+    cfg.account = None;
+    cfg.token = None;
+    cfg.save(path)?;
+    println!("logged out");
+    Ok(())
+}
+
+fn do_plug(cfg: &mut Config, path: &PathBuf, sub: PlugCmd) -> Result<()> {
+    match sub {
+        PlugCmd::List => {
+            if cfg.plugs.is_empty() {
+                println!("no plugs configured; use `oray-tools plug add <name> <sn>`");
+                return Ok(());
+            }
+            let mut names: Vec<_> = cfg.plugs.keys().collect();
+            names.sort();
+            for name in names {
+                let d = &cfg.plugs[name];
+                let mark = if name == "default" { " (default)" } else { "" };
+                println!("{name}{mark}: sn={} default_index={}", d.sn, d.index);
+            }
+        }
+        PlugCmd::Add { name, sn, index } => {
+            if sn.trim().is_empty() {
+                bail!("SN must not be empty");
+            }
+            cfg.plugs.insert(name.clone(), config::Device { sn: sn.clone(), index });
+            cfg.save(path)?;
+            println!("plug '{name}' registered: sn={sn} index={index}");
+        }
+        PlugCmd::Remove { name } => {
+            if cfg.plugs.remove(&name).is_none() {
+                bail!("no plug named '{name}'");
+            }
+            cfg.save(path)?;
+            println!("plug '{name}' removed");
+        }
+        PlugCmd::Status { name, index } => {
+            do_plug_action(cfg, path, name.as_deref(), index, plug::PlugAction::Status)?
+        }
+        PlugCmd::On { name, index } => {
+            do_plug_action(cfg, path, name.as_deref(), index, plug::PlugAction::On)?
+        }
+        PlugCmd::Off { name, index } => {
+            do_plug_action(cfg, path, name.as_deref(), index, plug::PlugAction::Off)?
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a plug by name; falls back to `default` or the only plug.
+fn resolve_plug(cfg: &Config, name: Option<&str>) -> Result<(String, config::Device)> {
+    if let Some(n) = name {
+        let d = cfg
+            .plugs
+            .get(n)
+            .with_context(|| format!("no plug named '{n}' (see `oray-tools plug list`)"))?;
+        return Ok((n.to_string(), d.clone()));
+    }
+    if let Some(d) = cfg.plugs.get("default") {
+        return Ok(("default".to_string(), d.clone()));
+    }
+    if cfg.plugs.len() == 1 {
+        let (k, v) = cfg.plugs.iter().next().unwrap();
+        return Ok((k.clone(), v.clone()));
+    }
+    bail!("no plug selected; pass a plug name (see `oray-tools plug list`)")
+}
+
+fn do_plug_action(cfg: &mut Config, path: &PathBuf, name: Option<&str>, index: Option<usize>, action: plug::PlugAction) -> Result<()> {
+    let (name, dev) = resolve_plug(cfg, name)?;
+    let index = index.unwrap_or(dev.index);
     let server = cfg.server();
     let token = auth::ensure_token(cfg, path)?;
     let client = auth::standard_client()?;
 
     match action {
         plug::PlugAction::Status => {
-            let r = plug::get_status(&client, &server.slapi_base, &token.access_token, &sn, index)?;
+            let r = plug::get_status(&client, &server.slapi_base, &token.access_token, &dev.sn, index)?;
             let mut found = false;
             if let Some(ports) = &r.response {
                 for p in ports {
                     if p.index as usize == index {
                         let state = if p.status == 1 { "ON" } else { "OFF" };
-                        println!("sn={sn} index={} status={state}", p.index);
+                        println!("plug={name} sn={} index={} status={state}", dev.sn, p.index);
                         found = true;
                     }
                 }
             }
             if !found {
-                println!("sn={sn} index={index} status=<<unknown>>");
+                println!("plug={name} sn={} index={index} status=<<unknown>>", dev.sn);
             }
         }
         plug::PlugAction::On => {
-            plug::set_status(&client, &server.slapi_base, &token.access_token, &sn, index, true)?;
-            println!("sn={sn} port={index} ON");
+            plug::set_status(&client, &server.slapi_base, &token.access_token, &dev.sn, index, true)?;
+            println!("plug={name} sn={} port={index} ON", dev.sn);
         }
         plug::PlugAction::Off => {
-            plug::set_status(&client, &server.slapi_base, &token.access_token, &sn, index, false)?;
-            println!("sn={sn} port={index} OFF");
+            plug::set_status(&client, &server.slapi_base, &token.access_token, &dev.sn, index, false)?;
+            println!("plug={name} sn={} port={index} OFF", dev.sn);
         }
     }
-    Ok(())
-}
-
-fn do_logout(cfg: &mut Config, path: &PathBuf) -> Result<()> {
-    cfg.account = None;
-    cfg.token = None;
-    cfg.save(path)?;
-    println!("logged out");
     Ok(())
 }
 
