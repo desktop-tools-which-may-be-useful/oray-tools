@@ -24,7 +24,6 @@ pub struct Token {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Device {
     pub sn: String,
-    pub index: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

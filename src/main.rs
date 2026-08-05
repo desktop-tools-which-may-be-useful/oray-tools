@@ -55,9 +55,6 @@ enum PlugCmd {
     Add {
         name: String,
         sn: String,
-        /// Default port index for this plug
-        #[arg(long, default_value_t = 0)]
-        index: usize,
     },
     /// Remove a configured plug
     Remove { name: String },
@@ -65,7 +62,7 @@ enum PlugCmd {
     Status {
         /// Plug name (defaults to `default` or the only configured plug)
         name: Option<String>,
-        /// Port index (defaults to the plug's configured index)
+        /// Port index (default: 0)
         #[arg(long)]
         index: Option<usize>,
     },
@@ -216,16 +213,16 @@ fn do_plug(cfg: &mut Config, path: &PathBuf, sub: PlugCmd) -> Result<()> {
             for name in names {
                 let d = &cfg.plugs[name];
                 let mark = if name == "default" { " (default)" } else { "" };
-                println!("{name}{mark}: sn={} default_index={}", d.sn, d.index);
+                println!("{name}{mark}: sn={}", d.sn);
             }
         }
-        PlugCmd::Add { name, sn, index } => {
+        PlugCmd::Add { name, sn } => {
             if sn.trim().is_empty() {
                 bail!("SN must not be empty");
             }
-            cfg.plugs.insert(name.clone(), config::Device { sn: sn.clone(), index });
+            cfg.plugs.insert(name.clone(), config::Device { sn: sn.clone() });
             cfg.save(path)?;
-            println!("plug '{name}' registered: sn={sn} index={index}");
+            println!("plug '{name}' registered: sn={sn}");
         }
         PlugCmd::Remove { name } => {
             if cfg.plugs.remove(&name).is_none() {
@@ -268,7 +265,7 @@ fn resolve_plug(cfg: &Config, name: Option<&str>) -> Result<(String, config::Dev
 
 fn do_plug_action(cfg: &mut Config, path: &PathBuf, name: Option<&str>, index: Option<usize>, action: plug::PlugAction) -> Result<()> {
     let (name, dev) = resolve_plug(cfg, name)?;
-    let index = index.unwrap_or(dev.index);
+    let index = index.unwrap_or(0);
     let server = cfg.server();
     let token = auth::ensure_token(cfg, path)?;
     let client = auth::standard_client()?;
