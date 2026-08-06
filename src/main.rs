@@ -22,7 +22,7 @@ struct Cli {
     #[arg(long, global = true)]
     config: Option<PathBuf>,
 
-    /// Trusted Ex-ClientId (default: built-in trusted id)
+    /// Trusted Ex-ClientId (default: machine-generated UUID, persisted to config)
     #[arg(long, global = true)]
     clientid: Option<String>,
 }
@@ -99,13 +99,21 @@ fn run(cli: Cli) -> Result<()> {
     }
 }
 
-fn resolve_clientid(cfg: &Config, cli_clientid: Option<&str>) -> String {
-    cli_clientid
+fn resolve_clientid(cfg: &mut Config, cli_clientid: Option<&str>) -> String {
+    if let Some(c) = cli_clientid.filter(|c| !c.is_empty()) {
+        return c.to_string();
+    }
+    if let Some(c) = cfg
+        .client
+        .as_ref()
+        .map(|c| c.clientid.clone())
         .filter(|c| !c.is_empty())
-        .or_else(|| cfg.client.as_ref().map(|c| c.clientid.as_str()))
-        .filter(|c| !c.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| auth::DEFAULT_CLIENT_ID.to_string())
+    {
+        return c;
+    }
+    let cid = auth::generate_client_id();
+    cfg.client = Some(config::Client { clientid: cid.clone() });
+    cid
 }
 
 fn do_login(cfg: &mut Config, path: &PathBuf, clientid: Option<&str>, account: &str, password: &str) -> Result<()> {
@@ -166,17 +174,20 @@ fn hostname() -> String {
 }
 
 fn do_refresh(cfg: &mut Config, path: &PathBuf, clientid: Option<&str>) -> Result<()> {
-    let token = cfg
-        .token
-        .as_ref()
-        .context("no token saved; run `oray-tools login` first")?;
-    if token.refresh_token.is_empty() {
-        bail!("no refresh token saved; run `oray-tools login` first");
-    }
+    let (access, refresh) = {
+        let token = cfg
+            .token
+            .as_ref()
+            .context("no token saved; run `oray-tools login` first")?;
+        if token.refresh_token.is_empty() {
+            bail!("no refresh token saved; run `oray-tools login` first");
+        }
+        (token.access_token.clone(), token.refresh_token.clone())
+    };
     let cid = resolve_clientid(cfg, clientid);
     let server = cfg.server();
     let client = auth::standard_client()?;
-    let resp = auth::refresh(&client, &server, &cid, &token.access_token, &token.refresh_token)?;
+    let resp = auth::refresh(&client, &server, &cid, &access, &refresh)?;
     let expiry = auth::refresh_expiry(&resp);
     cfg.token = Some(config::Token {
         access_token: resp.access_token,

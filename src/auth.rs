@@ -7,10 +7,14 @@ use serde_json::json;
 
 pub const ACCOUNT_TYPE: &str = "password";
 pub const APP_ID: &str = "kNUC97u86Zr7mt9xeZVl";
-/// Trusted client id that this account has already registered on Oray's side.
-pub const DEFAULT_CLIENT_ID: &str = "7961d212-3572-4e56-9757-5ac129b339d8";
 /// Salt used to compute the sendcode `checksum`.
 pub const CHECKSUM_SALT: &str = "sunlogin.oray.com";
+
+/// Generate a machine-local client id (UUID v4). A fresh id triggers Oray's
+/// one-time SMS verification on first login, after which it is trusted.
+pub fn generate_client_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct AuthResponse {
@@ -238,11 +242,18 @@ pub fn human_time(ts: i64) -> String {
         .unwrap_or_else(|| ts.to_string())
 }
 
-fn client_id(cfg: &Config) -> String {
-    cfg.client
+fn client_id(cfg: &mut Config) -> String {
+    if let Some(cid) = cfg
+        .client
         .as_ref()
-        .and_then(|c| if c.clientid.is_empty() { None } else { Some(c.clientid.clone()) })
-        .unwrap_or_else(|| DEFAULT_CLIENT_ID.to_string())
+        .map(|c| c.clientid.clone())
+        .filter(|c| !c.is_empty())
+    {
+        return cid;
+    }
+    let cid = generate_client_id();
+    cfg.client = Some(crate::config::Client { clientid: cid.clone() });
+    cid
 }
 
 /// Return a usable token, refreshing (and persisting) if needed.
