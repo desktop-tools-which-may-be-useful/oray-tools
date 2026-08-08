@@ -11,6 +11,8 @@ ARCH=${3:?termux arch}
 OUT=${4:?output .deb path}
 
 [[ -f "$BIN" ]] || { echo "error: binary not found: $BIN" >&2; exit 1; }
+[[ "$OUT" = /* ]] || OUT="$PWD/$OUT"
+mkdir -p "$(dirname "$OUT")"
 INSTALLED=$(du -k "$BIN" | cut -f1)
 
 root=$(mktemp -d)
