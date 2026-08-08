@@ -35,7 +35,7 @@
                 - tokens / logout: show token info / clear saved state
                 Config is stored in $XDG_CONFIG_HOME/oray-tools/config.toml.
               '';
-              homepage = "https://github.com/anomalyco/opencode";
+              homepage = "https://github.com/desktop-tools-which-may-be-useful/oray-tools";
               license = licenses.mit;
               platforms = platforms.linux;
               mainProgram = "oray-tools";
