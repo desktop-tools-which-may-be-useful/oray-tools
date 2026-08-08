@@ -1,0 +1,82 @@
+name: termux-repo
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/termux/**'
+      - '.github/workflows/termux.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, armv7-linux-androideabi, x86_64-linux-android
+
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27c
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Cross-compile for Termux
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            case "$abi" in
+              arm64-v8a) arch=aarch64 ;;
+              armeabi-v7a) arch=arm ;;
+              x86_64) arch=x86_64 ;;
+            esac
+            cargo ndk -t "$abi" -o "target/termux/$arch" build --release --locked
+          done
+
+      - name: Package .deb files
+        run: |
+          chmod +x scripts/termux/mkdeb.sh
+          VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          mkdir -p repo/pool/main
+          for arch in aarch64 arm x86_64; do
+            BIN="$(find "target/termux/$arch" -type f -name oray-tools | head -1)"
+            [ -n "$BIN" ] || { echo "no binary for $arch" >&2; exit 1; }
+            scripts/termux/mkdeb.sh "$BIN" "$VERSION" "$arch" "repo/pool/main/oray-tools_${VERSION}_${arch}.deb"
+          done
+
+      - name: Generate apt repository metadata
+        env:
+          GPG_KEY: ${{ secrets.TERMUX_REPO_GPG_KEY }}
+        run: python3 scripts/termux/mkrepo.py repo
+
+      - name: Verify repository layout
+        run: |
+          find repo -type f | sort
+          ls repo/dists/stable/main/binary-aarch64/Packages
+          awk '/^Package:/{print}' repo/dists/stable/main/binary-aarch64/Packages
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: repo
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
