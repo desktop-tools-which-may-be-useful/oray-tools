@@ -46,6 +46,13 @@ jobs:
           export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$NDK_TOOLCHAIN/bin/x86_64-linux-android24-clang"
           export CARGO_TARGET_X86_64_LINUX_ANDROID_AR="$NDK_TOOLCHAIN/bin/llvm-ar"
 
+          export CC_aarch64_linux_android="$NDK_TOOLCHAIN/bin/aarch64-linux-android24-clang"
+          export AR_aarch64_linux_android="$NDK_TOOLCHAIN/bin/llvm-ar"
+          export CC_armv7_linux_androideabi="$NDK_TOOLCHAIN/bin/armv7a-linux-androideabi24-clang"
+          export AR_armv7_linux_androideabi="$NDK_TOOLCHAIN/bin/llvm-ar"
+          export CC_x86_64_linux_android="$NDK_TOOLCHAIN/bin/x86_64-linux-android24-clang"
+          export AR_x86_64_linux_android="$NDK_TOOLCHAIN/bin/llvm-ar"
+
           cargo build --target aarch64-linux-android --release --locked
           cargo build --target armv7-linux-androideabi --release --locked
           cargo build --target x86_64-linux-android --release --locked
