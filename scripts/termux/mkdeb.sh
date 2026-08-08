@@ -28,7 +28,6 @@ Version: $VER
 Architecture: $ARCH
 Maintainer: desktop-tools-which-may-be-useful
 Installed-Size: $INSTALLED
-Depends: libc
 Section: utils
 Priority: optional
 Description: Oray smart plug control CLI
