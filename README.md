@@ -55,12 +55,25 @@ Add it to your system configuration:
 ### Termux (Android)
 
 Binaries are cross-compiled for `aarch64`, `arm` (armeabi-v7a) and `x86_64`
-and published as an apt repository on GitHub Pages:
+and published as an apt repository at `/termux` on GitHub Pages:
 
 ```
-echo "deb [trusted=yes] https://desktop-tools-which-may-be-useful.github.io/oray-tools stable main" > $PREFIX/etc/apt/sources.list.d/oray-tools.list
+echo "deb [trusted=yes] https://desktop-tools-which-may-be-useful.github.io/oray-tools/termux stable main" > $PREFIX/etc/apt/sources.list.d/oray-tools.list
 pkg update
 pkg install oray-tools
+```
+
+The repository is currently unsigned, so the source uses `[trusted=yes]`.
+
+### Debian / Ubuntu
+
+Binaries are built for `amd64`, `arm64` and `armhf` and published as a standard
+apt repository at `/debian` on GitHub Pages:
+
+```
+echo "deb [trusted=yes] https://desktop-tools-which-may-be-useful.github.io/oray-tools/debian stable main" > /etc/apt/sources.list.d/oray-tools.list
+apt-get update
+apt-get install oray-tools
 ```
 
 The repository is currently unsigned, so the source uses `[trusted=yes]`.

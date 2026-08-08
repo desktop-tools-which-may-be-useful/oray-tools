@@ -51,6 +51,9 @@ def control_field(control: str, field: str) -> str:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("repo", help="repository root (contains pool/)")
+    ap.add_argument("--label", default="oray-tools", help="Release Label (default: oray-tools)")
+    ap.add_argument("--origin", default="oray-tools", help="Release Origin (default: oray-tools)")
+    ap.add_argument("--desc", default="oray-tools repository", help="Release Description")
     args = ap.parse_args()
     repo = os.path.abspath(args.repo)
 
@@ -93,8 +96,8 @@ def main() -> None:
     archs = " ".join(sorted(by_arch))
     now = datetime.now(timezone.utc)
     release = (
-        f"Origin: oray-tools\n"
-        f"Label: oray-tools\n"
+        f"Origin: {args.origin}\n"
+        f"Label: {args.label}\n"
         f"Suite: {SUITE}\n"
         f"Codename: {SUITE}\n"
         f"Version: 1.0\n"
@@ -102,7 +105,7 @@ def main() -> None:
         f"Components: {COMPONENT}\n"
         f"Date: {now.strftime('%a, %d %b %Y %H:%M:%S %z')}\n"
         f"Valid-Until: {(now + timedelta(days=730)).strftime('%a, %d %b %Y %H:%M:%S %z')}\n"
-        f"Description: oray-tools Termux repository\n"
+        f"Description: {args.desc}\n"
     )
 
     def hash_lines(algo: str) -> str:

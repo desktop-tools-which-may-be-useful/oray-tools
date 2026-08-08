@@ -1,4 +1,4 @@
-name: termux-repo
+name: apt-repos
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/termux/**'
-      - '.github/workflows/termux.yml'
+      - '.github/workflows/apt-repos.yml'
   workflow_dispatch:
 
 permissions:
@@ -28,14 +28,21 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android, armv7-linux-androideabi, x86_64-linux-android
+          targets: >-
+            aarch64-linux-android, armv7-linux-androideabi, x86_64-linux-android,
+            aarch64-unknown-linux-gnu, armv7-unknown-linux-gnueabihf
 
       - uses: nttld/setup-ndk@v1
         id: ndk
         with:
           ndk-version: r27c
 
-      - name: Cross-compile for Termux
+      - name: Install Debian cross toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
+
+      - name: Cross-compile Termux binaries
         env:
           NDK_TOOLCHAIN: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64
         run: |
@@ -62,27 +69,62 @@ jobs:
           cp target/armv7-linux-androideabi/release/oray-tools target/termux/arm/oray-tools
           cp target/x86_64-linux-android/release/oray-tools target/termux/x86_64/oray-tools
 
+      - name: Build Debian binaries
+        run: |
+          export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+          export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_AR=aarch64-linux-gnu-ar
+          export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc
+          export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_AR=arm-linux-gnueabihf-ar
+          export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+          export AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar
+          export CC_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-gcc
+          export AR_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-ar
+
+          cargo build --release --locked
+          cargo build --target aarch64-unknown-linux-gnu --release --locked
+          cargo build --target armv7-unknown-linux-gnueabihf --release --locked
+
+          mkdir -p target/debian/amd64 target/debian/arm64 target/debian/armhf
+          cp target/release/oray-tools target/debian/amd64/oray-tools
+          cp target/aarch64-unknown-linux-gnu/release/oray-tools target/debian/arm64/oray-tools
+          cp target/armv7-unknown-linux-gnueabihf/release/oray-tools target/debian/armhf/oray-tools
+
       - name: Package .deb files
         run: |
           chmod +x scripts/termux/mkdeb.sh
           VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
-          mkdir -p repo/pool/main
+
+          mkdir -p repo/termux/pool/main
           for arch in aarch64 arm x86_64; do
             BIN="$(find "target/termux/$arch" -type f -name oray-tools | head -1)"
             [ -n "$BIN" ] || { echo "no binary for $arch" >&2; exit 1; }
-            scripts/termux/mkdeb.sh "$BIN" "$VERSION" "$arch" "repo/pool/main/oray-tools_${VERSION}_${arch}.deb"
+            scripts/termux/mkdeb.sh "$BIN" "$VERSION" "$arch" "repo/termux/pool/main/oray-tools_${VERSION}_${arch}.deb" termux
+          done
+
+          mkdir -p repo/debian/pool/main
+          for arch in amd64 arm64 armhf; do
+            BIN="$(find "target/debian/$arch" -type f -name oray-tools | head -1)"
+            [ -n "$BIN" ] || { echo "no binary for $arch" >&2; exit 1; }
+            scripts/termux/mkdeb.sh "$BIN" "$VERSION" "$arch" "repo/debian/pool/main/oray-tools_${VERSION}_${arch}.deb" debian
           done
 
       - name: Generate apt repository metadata
         env:
-          GPG_KEY: ${{ secrets.TERMUX_REPO_GPG_KEY }}
-        run: python3 scripts/termux/mkrepo.py repo
+          GPG_KEY: ${{ secrets.REPO_GPG_KEY }}
+        run: |
+          python3 scripts/termux/mkrepo.py repo/termux \
+            --label "oray-tools (Termux)" --origin "oray-tools-termux" \
+            --desc "oray-tools Termux repository"
+          python3 scripts/termux/mkrepo.py repo/debian \
+            --label "oray-tools (Debian)" --origin "oray-tools-debian" \
+            --desc "oray-tools Debian/Ubuntu repository"
 
       - name: Verify repository layout
         run: |
           find repo -type f | sort
-          ls repo/dists/stable/main/binary-aarch64/Packages
-          awk '/^Package:/{print}' repo/dists/stable/main/binary-aarch64/Packages
+          awk '/^Package:/{print}' repo/termux/dists/stable/main/binary-aarch64/Packages
+          awk '/^Package:/{print}' repo/debian/dists/stable/main/binary-amd64/Packages
+          awk '/^Package:/{print}' repo/debian/dists/stable/main/binary-arm64/Packages
 
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
