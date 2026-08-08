@@ -18,9 +18,11 @@ INSTALLED=$(du -k "$BIN" | cut -f1)
 root=$(mktemp -d)
 trap 'rm -rf "$root"' EXIT
 
-mkdir -p "$root/root/usr/bin"
-cp "$BIN" "$root/root/usr/bin/oray-tools"
-chmod 755 "$root/root/usr/bin/oray-tools"
+# Termux .deb data tarballs carry full paths under ./data/data/com.termux/files
+# (the Termux root filesystem); dpkg maps them onto the Android app data dir.
+mkdir -p "$root/data/data/com.termux/files/usr/bin"
+cp "$BIN" "$root/data/data/com.termux/files/usr/bin/oray-tools"
+chmod 755 "$root/data/data/com.termux/files/usr/bin/oray-tools"
 
 cat > "$root/control" <<EOF
 Package: oray-tools
@@ -33,10 +35,10 @@ Priority: optional
 Description: Oray smart plug control CLI
 EOF
 
-( cd "$root" && tar --owner=0 --group=0 --numeric-owner -czf control.tar.gz ./control )
-( cd "$root/root" && tar --owner=0 --group=0 --numeric-owner -czf "$root/data.tar.gz" ./usr )
+( cd "$root" && tar --owner=0 --group=0 --numeric-owner -cJf control.tar.xz ./control )
+( cd "$root" && tar --owner=0 --group=0 --numeric-owner -cJf data.tar.xz ./data )
 
 printf '2.0\n' > "$root/debian-binary"
-( cd "$root" && ar rcs "$OUT" debian-binary control.tar.gz data.tar.gz )
+( cd "$root" && ar rcs "$OUT" debian-binary control.tar.xz data.tar.xz )
 
 echo "built $OUT"
