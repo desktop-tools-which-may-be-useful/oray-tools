@@ -37,17 +37,17 @@ mkdir -p "$install_dir"
 cp "$BIN" "$install_dir/oray-tools"
 chmod 755 "$install_dir/oray-tools"
 
-cat > "$root/control" <<EOF
-Package: oray-tools
-Version: $VER
-Architecture: $ARCH
-Maintainer: desktop-tools-which-may-be-useful
-Installed-Size: $INSTALLED
-${depends:-}
-Section: utils
-Priority: optional
-Description: Oray smart plug control CLI
-EOF
+{
+  printf 'Package: oray-tools\n'
+  printf 'Version: %s\n' "$VER"
+  printf 'Architecture: %s\n' "$ARCH"
+  printf 'Maintainer: desktop-tools-which-may-be-useful\n'
+  printf 'Installed-Size: %s\n' "$INSTALLED"
+  [[ -n "${depends:-}" ]] && printf '%s\n' "$depends"
+  printf 'Section: utils\n'
+  printf 'Priority: optional\n'
+  printf 'Description: Oray smart plug control CLI\n'
+} > "$root/control"
 
 ( cd "$root" && tar --owner=0 --group=0 --numeric-owner -cJf control.tar.xz ./control )
 if [[ "$FLAVOR" == termux ]]; then
