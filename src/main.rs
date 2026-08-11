@@ -3,7 +3,7 @@ mod config;
 mod plug;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use config::Config;
 use std::path::PathBuf;
 
@@ -18,7 +18,7 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 
-    /// Path to config file (default: $XDG_CONFIG_HOME/oray-tools/config.toml)
+    /// Path to config file (overrides the platform default location)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
 
@@ -81,7 +81,14 @@ enum PlugCmd {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let mut cmd = Cli::command();
+    if let Ok(default) = config::Config::default_path() {
+        cmd = cmd.mut_arg(
+            "config",
+            |a| a.help(format!("Path to config file (default: {})", default.display())),
+        );
+    }
+    let cli = Cli::from_arg_matches(&cmd.get_matches()).unwrap_or_else(|e| e.exit());
     if let Err(e) = run(cli) {
         eprintln!("error: {e:#}");
         std::process::exit(1);
