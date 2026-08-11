@@ -78,6 +78,20 @@ apt-get install oray-tools
 
 The repository is currently unsigned, so the source uses `[trusted=yes]`.
 
+### Windows
+
+Self-contained executables for `x86_64` and `aarch64` (Windows on ARM) are
+cross-compiled with the GNU toolchain (static CRT, no extra DLLs) and published
+at:
+
+```
+https://desktop-tools-which-may-be-useful.github.io/oray-tools/windows/
+```
+
+Download `oray-tools-<version>-x86_64.exe` (or `-aarch64.exe`) and run it from
+PowerShell or CMD. Windows SmartScreen may warn about the unsigned binary on
+first run — choose *More info > Run anyway*.
+
 ## Usage
 
 ```

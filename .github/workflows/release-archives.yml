@@ -1,4 +1,4 @@
-name: apt-repos
+name: release-archives
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/termux/**'
-      - '.github/workflows/apt-repos.yml'
+      - '.github/workflows/release-archives.yml'
   workflow_dispatch:
 
 permissions:
@@ -30,17 +30,19 @@ jobs:
         with:
           targets: >-
             aarch64-linux-android, armv7-linux-androideabi, x86_64-linux-android,
-            aarch64-unknown-linux-gnu, armv7-unknown-linux-gnueabihf
+            aarch64-unknown-linux-gnu, armv7-unknown-linux-gnueabihf,
+            x86_64-pc-windows-gnu, aarch64-pc-windows-gnu
 
       - uses: nttld/setup-ndk@v1
         id: ndk
         with:
           ndk-version: r27c
 
-      - name: Install Debian cross toolchains
+      - name: Install Debian and Windows cross toolchains
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
+          sudo apt-get install -y gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf \
+            gcc-mingw-w64-x86-64 gcc-mingw-w64-aarch64
 
       - name: Cross-compile Termux binaries
         env:
@@ -89,6 +91,27 @@ jobs:
           cp target/aarch64-unknown-linux-gnu/release/oray-tools target/debian/arm64/oray-tools
           cp target/armv7-unknown-linux-gnueabihf/release/oray-tools target/debian/armhf/oray-tools
 
+      - name: Build Windows binaries (mingw, static CRT)
+        run: |
+          export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc
+          export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_AR=x86_64-w64-mingw32-ar
+          export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS="-C target-feature=+crt-static"
+          export CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc
+          export AR_x86_64_pc_windows_gnu=x86_64-w64-mingw32-ar
+
+          export CARGO_TARGET_AARCH64_PC_WINDOWS_GNU_LINKER=aarch64-w64-mingw32-gcc
+          export CARGO_TARGET_AARCH64_PC_WINDOWS_GNU_AR=aarch64-w64-mingw32-ar
+          export CARGO_TARGET_AARCH64_PC_WINDOWS_GNU_RUSTFLAGS="-C target-feature=+crt-static"
+          export CC_aarch64_pc_windows_gnu=aarch64-w64-mingw32-gcc
+          export AR_aarch64_pc_windows_gnu=aarch64-w64-mingw32-ar
+
+          cargo build --target x86_64-pc-windows-gnu --release --locked
+          cargo build --target aarch64-pc-windows-gnu --release --locked
+
+          mkdir -p target/windows/x86_64 target/windows/aarch64
+          cp target/x86_64-pc-windows-gnu/release/oray-tools.exe target/windows/x86_64/oray-tools.exe
+          cp target/aarch64-pc-windows-gnu/release/oray-tools.exe target/windows/aarch64/oray-tools.exe
+
       - name: Package .deb files
         run: |
           chmod +x scripts/termux/mkdeb.sh
@@ -108,6 +131,20 @@ jobs:
             scripts/termux/mkdeb.sh "$BIN" "$VERSION" "$arch" "repo/debian/pool/main/oray-tools_${VERSION}_${arch}.deb" debian
           done
 
+      - name: Package Windows binaries
+        run: |
+          VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          mkdir -p repo/windows
+          for arch in x86_64 aarch64; do
+            EXE="oray-tools-${VERSION}-${arch}.exe"
+            cp "target/windows/$arch/oray-tools.exe" "repo/windows/$EXE"
+            sha256sum "repo/windows/$EXE" | cut -d' ' -f1 > "repo/windows/$EXE.sha256"
+          done
+          echo "== DLL imports (must be Windows system DLLs only) =="
+          for f in repo/windows/*.exe; do echo "$f:"; objdump -p "$f" | grep -E 'DLL Name|file format' || true; done
+          python3 scripts/termux/mkindex.py "$VERSION" repo/windows
+          ls -la repo/windows
+
       - name: Generate apt repository metadata
         env:
           GPG_KEY: ${{ secrets.REPO_GPG_KEY }}
@@ -125,6 +162,7 @@ jobs:
           awk '/^Package:/{print}' repo/termux/dists/stable/main/binary-aarch64/Packages
           awk '/^Package:/{print}' repo/debian/dists/stable/main/binary-amd64/Packages
           awk '/^Package:/{print}' repo/debian/dists/stable/main/binary-arm64/Packages
+          file repo/windows/*.exe
 
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
