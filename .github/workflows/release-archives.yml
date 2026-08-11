@@ -160,18 +160,15 @@ jobs:
           MAKE_RELEASE: ${{ inputs.release }}
         run: |
           set -euo pipefail
-          # clean, human-friendly asset names
+          # clean, human-friendly asset names (use known arch lists, not
+          # filename parsing: x86_64 contains an underscore)
           STAGE="${{ github.workspace }}/stage"
           mkdir -p "$STAGE"
-          for f in pool/termux/*.deb; do
-            name="$(basename "$f")"   # oray-tools_0.1.4_aarch64.deb
-            arch="$(echo "$name" | sed -E 's/.*_([^_]+)\.deb$/\1/')"
-            cp "$f" "$STAGE/termux-${arch}.deb"
+          for arch in aarch64 arm x86_64; do
+            cp "pool/termux/oray-tools_${VERSION}_${arch}.deb" "$STAGE/termux-${arch}.deb"
           done
-          for f in pool/debian/*.deb; do
-            name="$(basename "$f")"
-            arch="$(echo "$name" | sed -E 's/.*_([^_]+)\.deb$/\1/')"
-            cp "$f" "$STAGE/debian-${arch}.deb"
+          for arch in amd64 arm64 armhf; do
+            cp "pool/debian/oray-tools_${VERSION}_${arch}.deb" "$STAGE/debian-${arch}.deb"
           done
           cp pool/*.exe "$STAGE/windows-x86_64.exe"
 
