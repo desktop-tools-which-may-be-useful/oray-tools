@@ -44,6 +44,12 @@ jobs:
             aarch64-unknown-linux-gnu, armv7-unknown-linux-gnueabihf,
             x86_64-pc-windows-gnu
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # dependency crates are cached per toolchain + Cargo.lock;
+          # target/ for cross targets is large, but shared across builds
+          cache-on-failure: true
+
       - uses: nttld/setup-ndk@v1
         id: ndk
         with:
