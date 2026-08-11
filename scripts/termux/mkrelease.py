@@ -43,6 +43,10 @@ def release_base(repo: str, tag: str) -> str:
     return f"https://github.com/{repo}/releases/download/{tag}"
 
 
+def version_from_tag(tag: str) -> str:
+    return tag[1:] if tag.startswith("v") else tag
+
+
 def scan_stage(stage: str, repo: str, tag: str) -> dict:
     assets = {}
     for f in sorted(os.listdir(stage)):
@@ -89,7 +93,7 @@ def cmd_index(args: argparse.Namespace) -> None:
         formal.append(
             {
                 "tag": tag,
-                "version": r.get("name") or tag,
+                "version": version_from_tag(tag),
                 "published_at": r.get("published_at"),
                 "manifest_url": f"{release_base(args.repo, tag)}/manifest.json",
             }
