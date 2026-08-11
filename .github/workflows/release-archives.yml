@@ -134,7 +134,7 @@ jobs:
           done
           echo "== DLL imports (must be Windows system DLLs only) =="
           for f in repo/windows/*.exe; do echo "$f:"; objdump -p "$f" | grep -E 'DLL Name|file format' || true; done
-          python3 scripts/termux/mkindex.py "$VERSION" repo/windows
+          python3 scripts/termux/mkindex.py "$VERSION" repo/windows > repo/windows/index.html
           ls -la repo/windows
 
       - name: Generate apt repository metadata
