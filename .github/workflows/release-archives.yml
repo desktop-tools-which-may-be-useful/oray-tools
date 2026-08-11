@@ -12,9 +12,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   pages: write
-  id-token: write
 
 concurrency:
   group: pages
@@ -151,15 +150,72 @@ jobs:
       - name: Verify repository layout
         run: |
           find repo -type f | sort
-          awk '/^Package:/{print}' repo/termux/dists/stable/main/binary-aarch64/Packages
-          awk '/^Package:/{print}' repo/debian/dists/stable/main/binary-amd64/Packages
-          awk '/^Package:/{print}' repo/debian/dists/stable/main/binary-arm64/Packages
           file repo/windows/*.exe
 
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: repo
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+      - name: Publish to gh-pages branch
+        env:
+          REPO: ${{ github.repository }}
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          AUTH="https://x-access-token:${TOKEN}@github.com/${REPO}.git"
+
+          rm -rf .pages
+          if git ls-remote --heads "$AUTH" gh-pages 2>/dev/null | grep -q 'refs/heads/gh-pages'; then
+            git clone --single-branch --branch gh-pages "$AUTH" .pages
+            EXISTING=1
+          else
+            mkdir -p .pages && git -C .pages init -b gh-pages
+            git -C .pages remote add origin "$AUTH"
+            EXISTING=0
+          fi
+
+          rm -rf .pages/termux .pages/debian .pages/windows
+          cp -r repo/termux .pages/termux
+          cp -r repo/debian .pages/debian
+          cp -r repo/windows .pages/windows
+          touch .pages/.nojekyll
+
+          mkdir -p stage
+          for arch in amd64 arm64 armhf; do
+            cp "repo/debian/pool/main/oray-tools_${VERSION}_${arch}.deb" "stage/debian-${arch}.deb"
+          done
+          for arch in aarch64 arm x86_64; do
+            cp "repo/termux/pool/main/oray-tools_${VERSION}_${arch}.deb" "stage/termux-${arch}.deb"
+          done
+          cp "repo/windows/oray-tools-${VERSION}-x86_64.exe" stage/windows-x86_64.exe
+
+          python3 scripts/termux/mkrelease.py .pages "$VERSION" stage
+
+          git -C .pages add -A
+          git -C .pages -c user.name=github-actions \
+            -c user.email=41898282+github-actions[bot]@users.noreply.github.com \
+            commit -m "Publish oray-tools ${VERSION}" || true
+          if [ "${EXISTING:-0}" = "1" ]; then
+            git -C .pages push origin gh-pages
+          else
+            git -C .pages push -u origin gh-pages
+          fi
+          git worktree prune 2>/dev/null || true
+          echo "published gh-pages for ${VERSION}"
+
+      - name: Point GitHub Pages at gh-pages branch
+        env:
+          REPO: ${{ github.repository }}
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if curl -fsS -H "Authorization: Bearer $TOKEN" \
+              "https://api.github.com/repos/$REPO/pages" | jq -e '.source.branch == "gh-pages"' >/dev/null 2>&1; then
+            echo "Pages already serves gh-pages branch"
+            exit 0
+          fi
+          if curl -fsS -X PUT -H "Authorization: Bearer $TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/pages" \
+              -d '{"build_type":"legacy","source":{"branch":"gh-pages","path":"/"}}'; then
+            echo "Pages source set to gh-pages branch"
+          else
+            echo "::warning::Could not set Pages source automatically. Go to Settings -> Pages -> Source -> Deploy from a branch -> gh-pages -> / (root)."
+          fi

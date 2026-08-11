@@ -92,6 +92,20 @@ Windows SmartScreen may warn about the unsigned binary on first run — choose
 *More info > Run anyway*. (ARM64 Windows is not built yet; the
 `aarch64-pc-windows-gnu` rust-std was removed from the stable toolchain.)
 
+### Machine-readable release index
+
+Every published version is also archived under `releases/<version>/` on the
+websites and indexed as JSON (handy for nvfetcher-style update checkers):
+
+```
+https://desktop-tools-which-may-be-useful.github.io/oray-tools/releases.json   # version list + all assets (newest first)
+https://desktop-tools-which-may-be-useful.github.io/oray-tools/latest.json     # latest version manifest
+https://desktop-tools-which-may-be-useful.github.io/oray-tools/releases/<version>/manifest.json
+```
+
+Each asset entry has `url`, `size` and `sha256`. The site is published from the
+`gh-pages` branch, so all historical versions stay available.
+
 ## Usage
 
 ```
