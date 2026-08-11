@@ -10,10 +10,22 @@ on:
       - 'scripts/termux/**'
       - '.github/workflows/release-archives.yml'
   workflow_dispatch:
+    inputs:
+      release:
+        type: boolean
+        required: false
+        default: false
+        description: 'Create a formal GitHub Release (tag v<version>)'
+      version:
+        type: string
+        required: false
+        default: ''
+        description: 'Version for the release (default: Cargo.toml version)'
 
 permissions:
   contents: write
   pages: write
+  id-token: write
 
 concurrency:
   group: pages
@@ -108,114 +120,147 @@ jobs:
           chmod +x scripts/termux/mkdeb.sh
           VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
 
-          mkdir -p repo/termux/pool/main
+          mkdir -p pool/termux pool/debian
           for arch in aarch64 arm x86_64; do
             BIN="$(find "target/termux/$arch" -type f -name oray-tools | head -1)"
             [ -n "$BIN" ] || { echo "no binary for $arch" >&2; exit 1; }
-            scripts/termux/mkdeb.sh "$BIN" "$VERSION" "$arch" "repo/termux/pool/main/oray-tools_${VERSION}_${arch}.deb" termux
+            scripts/termux/mkdeb.sh "$BIN" "$VERSION" "$arch" "pool/termux/oray-tools_${VERSION}_${arch}.deb" termux
           done
 
-          mkdir -p repo/debian/pool/main
           for arch in amd64 arm64 armhf; do
             BIN="$(find "target/debian/$arch" -type f -name oray-tools | head -1)"
             [ -n "$BIN" ] || { echo "no binary for $arch" >&2; exit 1; }
-            scripts/termux/mkdeb.sh "$BIN" "$VERSION" "$arch" "repo/debian/pool/main/oray-tools_${VERSION}_${arch}.deb" debian
+            scripts/termux/mkdeb.sh "$BIN" "$VERSION" "$arch" "pool/debian/oray-tools_${VERSION}_${arch}.deb" debian
           done
 
-      - name: Package Windows binaries
+      - name: Build Windows artifact
         run: |
           VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
-          mkdir -p repo/windows
-          for arch in x86_64; do
-            EXE="oray-tools-${VERSION}-${arch}.exe"
-            cp "target/windows/$arch/oray-tools.exe" "repo/windows/$EXE"
-            sha256sum "repo/windows/$EXE" | cut -d' ' -f1 > "repo/windows/$EXE.sha256"
-          done
+          cp target/windows/x86_64/oray-tools.exe "pool/oray-tools-${VERSION}-x86_64.exe"
+          sha256sum "pool/oray-tools-${VERSION}-x86_64.exe" | cut -d' ' -f1 \
+            > "pool/oray-tools-${VERSION}-x86_64.exe.sha256"
           echo "== DLL imports (must be Windows system DLLs only) =="
-          for f in repo/windows/*.exe; do echo "$f:"; objdump -p "$f" | grep -E 'DLL Name|file format' || true; done
-          python3 scripts/termux/mkindex.py "$VERSION" repo/windows > repo/windows/index.html
-          ls -la repo/windows
+          objdump -p "pool/oray-tools-${VERSION}-x86_64.exe" | grep -E 'DLL Name|file format' || true
+
+      - name: Resolve version and tag
+        id: version
+        run: |
+          CARGO_VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          VERSION="${{ inputs.version }}"
+          if [ -z "$VERSION" ]; then VERSION="$CARGO_VERSION"; fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "cargo_version=$CARGO_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update GitHub Release
+        id: release
+        env:
+          REPO: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+          MAKE_RELEASE: ${{ inputs.release }}
+        run: |
+          set -euo pipefail
+          # clean, human-friendly asset names
+          STAGE="${{ github.workspace }}/stage"
+          mkdir -p "$STAGE"
+          for f in pool/termux/*.deb; do
+            name="$(basename "$f")"   # oray-tools_0.1.4_aarch64.deb
+            arch="$(echo "$name" | sed -E 's/.*_([^_]+)\.deb$/\1/')"
+            cp "$f" "$STAGE/termux-${arch}.deb"
+          done
+          for f in pool/debian/*.deb; do
+            name="$(basename "$f")"
+            arch="$(echo "$name" | sed -E 's/.*_([^_]+)\.deb$/\1/')"
+            cp "$f" "$STAGE/debian-${arch}.deb"
+          done
+          cp pool/*.exe "$STAGE/windows-x86_64.exe"
+
+          NOTES="Built from \`${GITHUB_SHA::12}\`. See the JSON indexes under /releases.json, /latest.json, /unstable.json."
+
+          if [ "$MAKE_RELEASE" = "true" ]; then
+            TAG="v${VERSION}"
+            if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+              echo "::error::Release $TAG already exists; pick a different version"
+              exit 1
+            fi
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            echo "kind=formal" >> "$GITHUB_OUTPUT"
+          else
+            TAG="unstable"
+            gh release delete unstable --repo "$REPO" --yes --cleanup-tag 2>/dev/null || true
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            echo "kind=unstable" >> "$GITHUB_OUTPUT"
+          fi
+
+          # manifest is part of the release assets so release.package URLs resolve
+          python3 scripts/termux/mkrelease.py manifest \
+            --version "$VERSION" --tag "$TAG" --repo "$REPO" \
+            --stage "$STAGE" --out "$STAGE/manifest.json"
+
+          if [ "$MAKE_RELEASE" = "true" ]; then
+            gh release create "$TAG" "$STAGE"/* \
+              --repo "$REPO" --title "oray-tools ${VERSION}" \
+              --notes "$NOTES" --target "$GITHUB_SHA"
+          else
+            gh release create "$TAG" "$STAGE"/* \
+              --repo "$REPO" --title "oray-tools unstable (${VERSION})" \
+              --notes "$NOTES" --prerelease --target "$GITHUB_SHA"
+          fi
+          echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Generate JSON indexes
+        env:
+          REPO: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.release.outputs.tag }}
+          STAGE: ${{ steps.release.outputs.stage }}
+        run: |
+          set -euo pipefail
+          mkdir -p pages
+          cp "$STAGE/manifest.json" pages/manifest.json
+          # latest/unstable always point at the build just produced
+          cp pages/manifest.json pages/latest.json
+          cp pages/manifest.json pages/unstable.json
+          gh api "repos/$REPO/releases?per_page=100" > pages/gh-releases.json
+          python3 scripts/termux/mkrelease.py index \
+            --repo "$REPO" --releases pages/gh-releases.json --out pages
+          rm -f pages/gh-releases.json
 
       - name: Generate apt repository metadata
         env:
           GPG_KEY: ${{ secrets.REPO_GPG_KEY }}
         run: |
-          python3 scripts/termux/mkrepo.py repo/termux \
+          mkdir -p pages/termux/pool/main pages/debian/pool/main
+          for f in pool/termux/*.deb; do cp "$f" "pages/termux/pool/main/$(basename "$f")"; done
+          for f in pool/debian/*.deb; do cp "$f" "pages/debian/pool/main/$(basename "$f")"; done
+
+          python3 scripts/termux/mkrepo.py pages/termux \
             --label "oray-tools (Termux)" --origin "oray-tools-termux" \
             --desc "oray-tools Termux repository"
-          python3 scripts/termux/mkrepo.py repo/debian \
+          python3 scripts/termux/mkrepo.py pages/debian \
             --label "oray-tools (Debian)" --origin "oray-tools-debian" \
             --desc "oray-tools Debian/Ubuntu repository"
 
-      - name: Verify repository layout
+      - name: Generate Windows index page
         run: |
-          find repo -type f | sort
-          file repo/windows/*.exe
+          VERSION="${{ steps.version.outputs.version }}"
+          mkdir -p pages/windows
+          cp pool/*.exe* pages/windows/
+          python3 scripts/termux/mkindex.py "$VERSION" pages/windows > pages/windows/index.html
 
-      - name: Publish to gh-pages branch
-        env:
-          REPO: ${{ github.repository }}
-          TOKEN: ${{ github.token }}
+      - name: Verify pages tree
         run: |
-          set -euo pipefail
-          VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
-          AUTH="https://x-access-token:${TOKEN}@github.com/${REPO}.git"
+          touch pages/.nojekyll
+          find pages -type f | sort | head -60
+          echo "== total =="
+          du -sh pages
 
-          rm -rf .pages
-          if git ls-remote --heads "$AUTH" gh-pages 2>/dev/null | grep -q 'refs/heads/gh-pages'; then
-            git clone --single-branch --branch gh-pages "$AUTH" .pages
-            EXISTING=1
-          else
-            mkdir -p .pages && git -C .pages init -b gh-pages
-            git -C .pages remote add origin "$AUTH"
-            EXISTING=0
-          fi
+      - name: Deploy to GitHub Pages
+        uses: actions/configure-pages@v5
 
-          rm -rf .pages/termux .pages/debian .pages/windows
-          cp -r repo/termux .pages/termux
-          cp -r repo/debian .pages/debian
-          cp -r repo/windows .pages/windows
-          touch .pages/.nojekyll
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: pages
 
-          mkdir -p stage
-          for arch in amd64 arm64 armhf; do
-            cp "repo/debian/pool/main/oray-tools_${VERSION}_${arch}.deb" "stage/debian-${arch}.deb"
-          done
-          for arch in aarch64 arm x86_64; do
-            cp "repo/termux/pool/main/oray-tools_${VERSION}_${arch}.deb" "stage/termux-${arch}.deb"
-          done
-          cp "repo/windows/oray-tools-${VERSION}-x86_64.exe" stage/windows-x86_64.exe
-
-          python3 scripts/termux/mkrelease.py .pages "$VERSION" stage
-
-          git -C .pages add -A
-          git -C .pages -c user.name=github-actions \
-            -c user.email=41898282+github-actions[bot]@users.noreply.github.com \
-            commit -m "Publish oray-tools ${VERSION}" || true
-          if [ "${EXISTING:-0}" = "1" ]; then
-            git -C .pages push origin gh-pages
-          else
-            git -C .pages push -u origin gh-pages
-          fi
-          git worktree prune 2>/dev/null || true
-          echo "published gh-pages for ${VERSION}"
-
-      - name: Point GitHub Pages at gh-pages branch
-        env:
-          REPO: ${{ github.repository }}
-          TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          if curl -fsS -H "Authorization: Bearer $TOKEN" \
-              "https://api.github.com/repos/$REPO/pages" | jq -e '.source.branch == "gh-pages"' >/dev/null 2>&1; then
-            echo "Pages already serves gh-pages branch"
-            exit 0
-          fi
-          if curl -fsS -X PUT -H "Authorization: Bearer $TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/$REPO/pages" \
-              -d '{"build_type":"legacy","source":{"branch":"gh-pages","path":"/"}}'; then
-            echo "Pages source set to gh-pages branch"
-          else
-            echo "::warning::Could not set Pages source automatically. Go to Settings -> Pages -> Source -> Deploy from a branch -> gh-pages -> / (root)."
-          fi
+      - name: Deploy Pages
+        uses: actions/deploy-pages@v4

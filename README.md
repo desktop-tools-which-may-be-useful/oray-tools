@@ -94,17 +94,32 @@ Windows SmartScreen may warn about the unsigned binary on first run — choose
 
 ### Machine-readable release index
 
-Every published version is also archived under `releases/<version>/` on the
-websites and indexed as JSON (handy for nvfetcher-style update checkers):
+Binaries live in [GitHub Releases](https://github.com/desktop-tools-which-may-be-useful/oray-tools/releases);
+the Pages site only hosts lightweight indexes and apt metadata. JSON endpoints
+(handy for nvfetcher-style update checkers):
 
 ```
-https://desktop-tools-which-may-be-useful.github.io/oray-tools/releases.json   # version list + all assets (newest first)
-https://desktop-tools-which-may-be-useful.github.io/oray-tools/latest.json     # latest version manifest
-https://desktop-tools-which-may-be-useful.github.io/oray-tools/releases/<version>/manifest.json
+https://desktop-tools-which-may-be-useful.github.io/oray-tools/manifest.json   # manifest of the build just published
+https://desktop-tools-which-may-be-useful.github.io/oray-tools/latest.json     # alias of manifest.json (latest build)
+https://desktop-tools-which-may-be-useful.github.io/oray-tools/unstable.json   # alias of manifest.json (unstable build)
+https://desktop-tools-which-may-be-useful.github.io/oray-tools/releases.json   # formal releases, newest first
 ```
 
-Each asset entry has `url`, `size` and `sha256`. The site is published from the
-`gh-pages` branch, so all historical versions stay available.
+Each manifest asset entry has `filename`, `url`, `size` and `sha256`, with
+`url` pointing at the GitHub Release download link. `releases.json` lists
+formal `v<version>` releases with their `manifest_url`.
+
+The workflow distinguishes two kinds of release (the `workflow_dispatch`
+inputs on the build action control this):
+
+- **Formal release** (`release: true`, with an optional `version`): stable
+  `v<version>` tag, kept forever.
+- **Unstable build** (every push): fixed `unstable` tag, always points at the
+  newest build so there is always a fresh distribution to fetch.
+
+The apt repositories and the Windows download page are served from the Pages
+deploy artifact (git never stores binaries), so each site only carries the
+latest `.deb`/`.exe` while history lives in GitHub Releases.
 
 ## Usage
 
