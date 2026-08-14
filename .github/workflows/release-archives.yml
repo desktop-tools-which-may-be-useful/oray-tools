@@ -4,7 +4,7 @@ on:
   push:
     branches: [ main ]
     paths:
-      - 'src/**'
+      - 'crates/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/termux/**'
@@ -124,7 +124,7 @@ jobs:
       - name: Package .deb files
         run: |
           chmod +x scripts/termux/mkdeb.sh
-          VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "oray-cli") | .version')"
 
           mkdir -p pool/termux pool/debian
           for arch in aarch64 arm x86_64; do
@@ -141,7 +141,7 @@ jobs:
 
       - name: Build Windows artifact
         run: |
-          VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "oray-cli") | .version')"
           cp target/windows/x86_64/oray-tools.exe "pool/oray-tools-${VERSION}-x86_64.exe"
           sha256sum "pool/oray-tools-${VERSION}-x86_64.exe" | cut -d' ' -f1 \
             > "pool/oray-tools-${VERSION}-x86_64.exe.sha256"
@@ -151,7 +151,7 @@ jobs:
       - name: Resolve version and tag
         id: version
         run: |
-          CARGO_VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          CARGO_VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "oray-cli") | .version')"
           VERSION="${{ inputs.version }}"
           if [ -z "$VERSION" ]; then VERSION="$CARGO_VERSION"; fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"

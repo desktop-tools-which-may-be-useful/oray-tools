@@ -746,7 +746,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
-name = "oray-tools"
+name = "oray-cli"
 version = "0.1.5"
 dependencies = [
  "anyhow",
@@ -754,12 +754,24 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "oray-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
+name = "oray-core"
+version = "0.1.5"
+dependencies = [
+ "chrono",
  "hex",
  "md-5",
  "reqwest",
  "serde",
  "serde_json",
- "toml",
+ "thiserror 2.0.19",
  "uuid",
 ]
 

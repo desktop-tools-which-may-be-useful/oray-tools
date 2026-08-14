@@ -1,10 +1,12 @@
-mod auth;
 mod config;
-mod plug;
+mod token;
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use config::Config;
+use oray_core::auth::AuthApi;
+use oray_core::plug::PlugApi;
+use reqwest::blocking::Client as HttpClient;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -80,6 +82,13 @@ enum PlugCmd {
     },
 }
 
+#[derive(Clone, Copy)]
+enum PlugAction {
+    Status,
+    On,
+    Off,
+}
+
 fn main() {
     let mut cmd = Cli::command();
     if let Ok(default) = config::Config::default_path() {
@@ -96,13 +105,16 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    let http = HttpClient::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()?;
     let (mut cfg, path) = Config::load(cli.config.as_ref())?;
     match cli.command {
-        Command::Login { account, password } => do_login(&mut cfg, &path, cli.clientid.as_deref(), &account, &password),
-        Command::Refresh => do_refresh(&mut cfg, &path, cli.clientid.as_deref()),
+        Command::Login { account, password } => do_login(&http, &mut cfg, &path, cli.clientid.as_deref(), &account, &password),
+        Command::Refresh => do_refresh(&http, &mut cfg, &path, cli.clientid.as_deref()),
         Command::Tokens => do_tokens(&cfg),
         Command::Logout => do_logout(&mut cfg, &path),
-        Command::Plug { sub } => do_plug(&mut cfg, &path, sub),
+        Command::Plug { sub } => do_plug(&http, &mut cfg, &path, sub),
     }
 }
 
@@ -118,25 +130,33 @@ fn resolve_clientid(cfg: &mut Config, cli_clientid: Option<&str>) -> String {
     {
         return c;
     }
-    let cid = auth::generate_client_id();
+    let cid = oray_core::auth::generate_client_id();
     cfg.client = Some(config::Client { clientid: cid.clone() });
     cid
 }
 
-fn do_login(cfg: &mut Config, path: &PathBuf, clientid: Option<&str>, account: &str, password: &str) -> Result<()> {
+fn do_login(
+    http: &HttpClient,
+    cfg: &mut Config,
+    path: &PathBuf,
+    clientid: Option<&str>,
+    account: &str,
+    password: &str,
+) -> Result<()> {
     let cid = resolve_clientid(cfg, clientid);
     let server = cfg.server();
-    let client = auth::standard_client()?;
+    let api = AuthApi::new(http.clone(), &server.api_base);
     let terminal_name = hostname();
-    let resp = match auth::login(&client, &server, &cid, account, password)? {
-        auth::LoginOutcome::Tokens(resp) => resp,
-        auth::LoginOutcome::NewDevice(alert) => {
+    let password_md5 = oray_core::auth::md5_hex(password);
+    let resp = match api.login(&cid, account, &password_md5)? {
+        oray_core::auth::LoginOutcome::Tokens(resp) => resp,
+        oray_core::auth::LoginOutcome::NewDevice(alert) => {
             let target = if !alert.mobile.is_empty() { &alert.mobile } else { &alert.email };
             eprintln!(
                 "New device detected ({}), code={}: {target} requires SMS verification. A code has been sent.",
                 alert.error, alert.code
             );
-            auth::sendcode(&client, &server, &cid, account).context("failed to send verification code")?;
+            api.sendcode(&cid, account).context("failed to send verification code")?;
             eprint!("Enter the SMS code: ");
             use std::io::Write;
             std::io::stdout().flush().ok();
@@ -148,11 +168,11 @@ fn do_login(cfg: &mut Config, path: &PathBuf, clientid: Option<&str>, account: &
             if code.is_empty() {
                 bail!("no code entered");
             }
-            auth::checkcode(&client, &server, &cid, account, &code, &terminal_name)
+            api.checkcode(&cid, account, &code, &terminal_name)
                 .context("failed to verify code")?;
             eprintln!("Device trusted, logging in again...");
-            match auth::login(&client, &server, &cid, account, password)? {
-                auth::LoginOutcome::Tokens(resp) => resp,
+            match api.login(&cid, account, &password_md5)? {
+                oray_core::auth::LoginOutcome::Tokens(resp) => resp,
                 other => bail!("re-login did not return tokens: {other:?}"),
             }
         }
@@ -160,10 +180,10 @@ fn do_login(cfg: &mut Config, path: &PathBuf, clientid: Option<&str>, account: &
 
     cfg.account = Some(config::Account {
         account: account.to_string(),
-        password_md5: auth::md5_hex(password),
+        password_md5,
     });
     cfg.client = Some(config::Client { clientid: cid });
-    let expiry = auth::refresh_expiry(&resp);
+    let expiry = token::refresh_expiry(&resp);
     cfg.token = Some(config::Token {
         access_token: resp.access_token,
         refresh_token: resp.refresh_token,
@@ -180,7 +200,12 @@ fn hostname() -> String {
         .unwrap_or_else(|_| "oray-tools".to_string())
 }
 
-fn do_refresh(cfg: &mut Config, path: &PathBuf, clientid: Option<&str>) -> Result<()> {
+fn do_refresh(
+    http: &HttpClient,
+    cfg: &mut Config,
+    path: &PathBuf,
+    clientid: Option<&str>,
+) -> Result<()> {
     let (access, refresh) = {
         let token = cfg
             .token
@@ -193,9 +218,9 @@ fn do_refresh(cfg: &mut Config, path: &PathBuf, clientid: Option<&str>) -> Resul
     };
     let cid = resolve_clientid(cfg, clientid);
     let server = cfg.server();
-    let client = auth::standard_client()?;
-    let resp = auth::refresh(&client, &server, &cid, &access, &refresh)?;
-    let expiry = auth::refresh_expiry(&resp);
+    let api = AuthApi::new(http.clone(), &server.api_base);
+    let resp = api.refresh(&cid, &access, &refresh)?;
+    let expiry = token::refresh_expiry(&resp);
     cfg.token = Some(config::Token {
         access_token: resp.access_token,
         refresh_token: resp.refresh_token,
@@ -219,7 +244,12 @@ fn do_logout(cfg: &mut Config, path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn do_plug(cfg: &mut Config, path: &PathBuf, sub: PlugCmd) -> Result<()> {
+fn do_plug(
+    http: &HttpClient,
+    cfg: &mut Config,
+    path: &PathBuf,
+    sub: PlugCmd,
+) -> Result<()> {
     match sub {
         PlugCmd::List => {
             if cfg.plugs.is_empty() {
@@ -250,13 +280,13 @@ fn do_plug(cfg: &mut Config, path: &PathBuf, sub: PlugCmd) -> Result<()> {
             println!("plug '{name}' removed");
         }
         PlugCmd::Status { name, index } => {
-            do_plug_action(cfg, path, name.as_deref(), index, plug::PlugAction::Status)?
+            do_plug_action(http, cfg, path, name.as_deref(), index, PlugAction::Status)?
         }
         PlugCmd::On { name, index } => {
-            do_plug_action(cfg, path, name.as_deref(), index, plug::PlugAction::On)?
+            do_plug_action(http, cfg, path, name.as_deref(), index, PlugAction::On)?
         }
         PlugCmd::Off { name, index } => {
-            do_plug_action(cfg, path, name.as_deref(), index, plug::PlugAction::Off)?
+            do_plug_action(http, cfg, path, name.as_deref(), index, PlugAction::Off)?
         }
     }
     Ok(())
@@ -281,16 +311,23 @@ fn resolve_plug(cfg: &Config, name: Option<&str>) -> Result<(String, config::Dev
     bail!("no plug selected; pass a plug name (see `oray-tools plug list`)")
 }
 
-fn do_plug_action(cfg: &mut Config, path: &PathBuf, name: Option<&str>, index: Option<usize>, action: plug::PlugAction) -> Result<()> {
+fn do_plug_action(
+    http: &HttpClient,
+    cfg: &mut Config,
+    path: &PathBuf,
+    name: Option<&str>,
+    index: Option<usize>,
+    action: PlugAction,
+) -> Result<()> {
     let (name, dev) = resolve_plug(cfg, name)?;
     let index = index.unwrap_or(0);
     let server = cfg.server();
-    let token = auth::ensure_token(cfg, path)?;
-    let client = auth::standard_client()?;
+    let token = token::ensure_token(http, cfg, path)?;
+    let api = PlugApi::new(http.clone(), &server.slapi_base);
 
     match action {
-        plug::PlugAction::Status => {
-            let r = plug::get_status(&client, &server.slapi_base, &token.access_token, &dev.sn, index)?;
+        PlugAction::Status => {
+            let r = api.get_status(&token.access_token, &dev.sn, index)?;
             let mut found = false;
             if let Some(ports) = &r.response {
                 for p in ports {
@@ -305,12 +342,12 @@ fn do_plug_action(cfg: &mut Config, path: &PathBuf, name: Option<&str>, index: O
                 println!("plug={name} sn={} index={index} status=<<unknown>>", dev.sn);
             }
         }
-        plug::PlugAction::On => {
-            plug::set_status(&client, &server.slapi_base, &token.access_token, &dev.sn, index, true)?;
+        PlugAction::On => {
+            api.set_status(&token.access_token, &dev.sn, index, true)?;
             println!("plug={name} sn={} port={index} ON", dev.sn);
         }
-        plug::PlugAction::Off => {
-            plug::set_status(&client, &server.slapi_base, &token.access_token, &dev.sn, index, false)?;
+        PlugAction::Off => {
+            api.set_status(&token.access_token, &dev.sn, index, false)?;
             println!("plug={name} sn={} port={index} OFF", dev.sn);
         }
     }
@@ -324,13 +361,13 @@ fn print_tokens(cfg: &Config) {
             println!("refresh_token:   {}", t.refresh_token);
             println!(
                 "access_expiry:   {}",
-                auth::access_expiry(&t.access_token)
-                    .map(auth::human_time)
+                token::access_expiry(&t.access_token)
+                    .map(token::human_time)
                     .unwrap_or_else(|| "unknown".to_string())
             );
             println!(
                 "refresh_expiry:  {}",
-                auth::human_time(t.refresh_expires)
+                token::human_time(t.refresh_expires)
             );
         }
         None => println!("no tokens saved"),

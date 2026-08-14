@@ -165,3 +165,21 @@ sn = "560056660997"
 
 Use `--config <path>` to point at a different file and `--clientid <id>` to
 override the trusted client ID for a single run.
+
+## Development
+
+The project is a Cargo workspace with two crates:
+
+- `crates/oray-core` — the protocol layer only, no filesystem/CLI surface.
+  `AuthApi` and `PlugApi` are stateless HTTP clients (login/refresh/
+  SMS-verification and device status/switch). The `reqwest` client, network
+  errors (`oray_core::Error`) and all state are owned by the caller.
+- `crates/oray-cli` — the `oray-tools` binary: clap argument parsing, command
+  dispatch, persisted config (`config.rs`), token lifecycle and client-id
+  management (`token.rs`). It injects a shared HTTP client into the core APIs
+  and owns every side effect.
+
+Dependencies flow one way only: `oray-cli → oray-core`. Build locally with
+`cargo build` (the workspace `default-members` builds only the CLI).
+Cross-compilation for the published targets (Termux/Debian/Windows) happens
+in the release workflow.
