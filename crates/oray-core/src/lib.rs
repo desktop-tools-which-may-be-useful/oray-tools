@@ -8,11 +8,19 @@ pub enum Error {
     #[error("network error: {0}")]
     Http(#[from] reqwest::Error),
     /// The endpoint returned a non-success HTTP status.
-    #[error("HTTP {status}: {body}")]
-    HttpStatus { status: u16, body: String },
+    #[error("{what} failed (HTTP {status}): {body}")]
+    HttpStatus {
+        what: &'static str,
+        status: u16,
+        body: String,
+    },
     /// The endpoint returned a success status but an unparseable body.
     #[error("unexpected response body: {body}")]
-    BadBody { body: String },
+    BadBody {
+        body: String,
+        #[source]
+        source: serde_json::Error,
+    },
     /// The endpoint rejected the request (business `result != 0`).
     #[error("{0}")]
     Api(String),

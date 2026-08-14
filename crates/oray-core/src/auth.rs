@@ -99,19 +99,22 @@ impl AuthApi {
         let status = resp.status();
         let text = resp.text()?;
         if status.as_u16() == 202 {
-            let alert: NewDeviceAlert = serde_json::from_str(&text).map_err(|_| Error::BadBody {
+            let alert: NewDeviceAlert = serde_json::from_str(&text).map_err(|e| Error::BadBody {
                 body: text.clone(),
+                source: e,
             })?;
             return Ok(LoginOutcome::NewDevice(alert));
         }
         if !status.is_success() {
             return Err(Error::HttpStatus {
+                what: "login",
                 status: status.as_u16(),
                 body: text,
             });
         }
-        let parsed: AuthResponse = serde_json::from_str(&text).map_err(|_| Error::BadBody {
+        let parsed: AuthResponse = serde_json::from_str(&text).map_err(|e| Error::BadBody {
             body: text.clone(),
+            source: e,
         })?;
         Ok(LoginOutcome::Tokens(parsed))
     }
@@ -133,7 +136,7 @@ impl AuthApi {
             .header("Content-Type", "application/json; charset=utf-8")
             .json(&body)
             .send()?;
-        check_ok(resp)
+        check_ok(resp, "sendcode")
     }
 
     /// Submit the SMS verification code, registering the clientid as trusted.
@@ -157,7 +160,7 @@ impl AuthApi {
             .header("Content-Type", "application/json; charset=utf-8")
             .json(&body)
             .send()?;
-        check_ok(resp)
+        check_ok(resp, "checkcode")
     }
 
     /// Exchange refresh_token (+ access_token) for fresh tokens.
@@ -179,11 +182,12 @@ impl AuthApi {
     }
 }
 
-fn check_ok(resp: reqwest::blocking::Response) -> Result<()> {
+fn check_ok(resp: reqwest::blocking::Response, what: &'static str) -> Result<()> {
     let status = resp.status();
     let text = resp.text()?;
     if !status.is_success() {
         return Err(Error::HttpStatus {
+            what,
             status: status.as_u16(),
             body: text,
         });
@@ -196,11 +200,15 @@ fn parse_token_resp(resp: reqwest::blocking::Response) -> Result<AuthResponse> {
     let text = resp.text()?;
     if !status.is_success() {
         return Err(Error::HttpStatus {
+            what: "refresh",
             status: status.as_u16(),
             body: text,
         });
     }
-    serde_json::from_str(&text).map_err(|_| Error::BadBody { body: text })
+    serde_json::from_str(&text).map_err(|e| Error::BadBody {
+        body: text.clone(),
+        source: e,
+    })
 }
 
 /// md5 (lowercase hex) of a string.

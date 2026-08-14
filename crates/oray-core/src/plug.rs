@@ -62,7 +62,7 @@ impl PlugApi {
             .send()?;
         let text = resp.text()?;
         let parsed: PlugStatusResp = serde_json::from_str(&text)
-            .map_err(|_| Error::BadBody { body: text.clone() })?;
+            .map_err(|e| Error::BadBody { body: text.clone(), source: e })?;
         if parsed.result != 0 {
             return Err(Error::Api(format!(
                 "get_plug_status failed (result={}) {}",
@@ -92,7 +92,7 @@ impl PlugApi {
             .send()?;
         let text = resp.text()?;
         let parsed: SetResp = serde_json::from_str(&text)
-            .map_err(|_| Error::BadBody { body: text.clone() })?;
+            .map_err(|e| Error::BadBody { body: text.clone(), source: e })?;
         if parsed.result != 0 {
             return Err(Error::Api(format!(
                 "set_plug_status failed (result={}) {}",
