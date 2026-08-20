@@ -77,17 +77,20 @@ fn client_id(cfg: &mut Config) -> String {
     cid
 }
 
-/// Return a usable token, refreshing (and persisting) if needed.
+/// Return a usable token, refreshing (and persisting) if needed. When `force`
+/// is set the access token is refreshed even if the local expiry check passes
+/// (used to recover from a server-side `TOKEN_EXPIRED`).
 pub fn ensure_token(
     http: &HttpClient,
     cfg: &mut Config,
     path: &PathBuf,
+    force: bool,
 ) -> Result<Token> {
     if cfg.account.is_none() {
         bail!("no account configured; run `oray-tools login`");
     }
     let current = cfg.token.clone().unwrap_or_default();
-    if !current.access_token.is_empty() && !is_access_expired(&current.access_token) {
+    if !force && !current.access_token.is_empty() && !is_access_expired(&current.access_token) {
         return Ok(current);
     }
     if current.refresh_token.is_empty() {

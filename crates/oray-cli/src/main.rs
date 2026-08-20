@@ -67,18 +67,27 @@ enum PlugCmd {
         /// Port index (default: 0)
         #[arg(long)]
         index: Option<usize>,
+        /// On server-side TOKEN_EXPIRED, refresh the token and retry once
+        #[arg(long)]
+        refresh_on_expired: bool,
     },
     /// Turn the plug on
     On {
         name: Option<String>,
         #[arg(long)]
         index: Option<usize>,
+        /// On server-side TOKEN_EXPIRED, refresh the token and retry once
+        #[arg(long)]
+        refresh_on_expired: bool,
     },
     /// Turn the plug off
     Off {
         name: Option<String>,
         #[arg(long)]
         index: Option<usize>,
+        /// On server-side TOKEN_EXPIRED, refresh the token and retry once
+        #[arg(long)]
+        refresh_on_expired: bool,
     },
 }
 
@@ -279,14 +288,14 @@ fn do_plug(
             cfg.save(path)?;
             println!("plug '{name}' removed");
         }
-        PlugCmd::Status { name, index } => {
-            do_plug_action(http, cfg, path, name.as_deref(), index, PlugAction::Status)?
+        PlugCmd::Status { name, index, refresh_on_expired } => {
+            do_plug_action(http, cfg, path, name.as_deref(), index, PlugAction::Status, refresh_on_expired)?
         }
-        PlugCmd::On { name, index } => {
-            do_plug_action(http, cfg, path, name.as_deref(), index, PlugAction::On)?
+        PlugCmd::On { name, index, refresh_on_expired } => {
+            do_plug_action(http, cfg, path, name.as_deref(), index, PlugAction::On, refresh_on_expired)?
         }
-        PlugCmd::Off { name, index } => {
-            do_plug_action(http, cfg, path, name.as_deref(), index, PlugAction::Off)?
+        PlugCmd::Off { name, index, refresh_on_expired } => {
+            do_plug_action(http, cfg, path, name.as_deref(), index, PlugAction::Off, refresh_on_expired)?
         }
     }
     Ok(())
@@ -318,40 +327,54 @@ fn do_plug_action(
     name: Option<&str>,
     index: Option<usize>,
     action: PlugAction,
+    refresh_on_expired: bool,
 ) -> Result<()> {
     let (name, dev) = resolve_plug(cfg, name)?;
     let index = index.unwrap_or(0);
     let server = cfg.server();
-    let token = token::ensure_token(http, cfg, path)?;
+    let mut token = token::ensure_token(http, cfg, path, false)?;
     let api = PlugApi::new(http.clone(), &server.slapi_base);
 
-    match action {
-        PlugAction::Status => {
-            let r = api.get_status(&token.access_token, &dev.sn, index)?;
-            let mut found = false;
-            if let Some(ports) = &r.response {
-                for p in ports {
-                    if p.index as usize == index {
-                        let state = if p.status == 1 { "ON" } else { "OFF" };
-                        println!("plug={name} sn={} index={} status={state}", dev.sn, p.index);
-                        found = true;
+    let run = |token: &str| -> oray_core::Result<()> {
+        match action {
+            PlugAction::Status => {
+                let r = api.get_status(token, &dev.sn, index)?;
+                let mut found = false;
+                if let Some(ports) = &r.response {
+                    for p in ports {
+                        if p.index as usize == index {
+                            let state = if p.status == 1 { "ON" } else { "OFF" };
+                            println!("plug={name} sn={} index={} status={state}", dev.sn, p.index);
+                            found = true;
+                        }
                     }
                 }
+                if !found {
+                    println!("plug={name} sn={} index={index} status=<<unknown>>", dev.sn);
+                }
             }
-            if !found {
-                println!("plug={name} sn={} index={index} status=<<unknown>>", dev.sn);
+            PlugAction::On => {
+                api.set_status(token, &dev.sn, index, true)?;
+                println!("plug={name} sn={} port={index} ON", dev.sn);
+            }
+            PlugAction::Off => {
+                api.set_status(token, &dev.sn, index, false)?;
+                println!("plug={name} sn={} port={index} OFF", dev.sn);
             }
         }
-        PlugAction::On => {
-            api.set_status(&token.access_token, &dev.sn, index, true)?;
-            println!("plug={name} sn={} port={index} ON", dev.sn);
+        Ok(())
+    };
+
+    match run(&token.access_token) {
+        Ok(()) => Ok(()),
+        Err(oray_core::Error::TokenExpired(_)) if refresh_on_expired => {
+            eprintln!("access token expired; refreshing and retrying...");
+            token = token::ensure_token(http, cfg, path, true)?;
+            run(&token.access_token)?;
+            Ok(())
         }
-        PlugAction::Off => {
-            api.set_status(&token.access_token, &dev.sn, index, false)?;
-            println!("plug={name} sn={} port={index} OFF", dev.sn);
-        }
+        Err(e) => Err(e.into()),
     }
-    Ok(())
 }
 
 fn print_tokens(cfg: &Config) {

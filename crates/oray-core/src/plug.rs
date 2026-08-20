@@ -61,10 +61,10 @@ impl PlugApi {
             .bearer_auth(access_token)
             .send()?;
         let text = resp.text()?;
-        let parsed: PlugStatusResp = serde_json::from_str(&text)
-            .map_err(|e| Error::BadBody { body: text.clone(), source: e })?;
+        let parsed: PlugStatusResp =
+            serde_json::from_str(&text).map_err(|e| Error::bad_body(text.clone(), e))?;
         if parsed.result != 0 {
-            return Err(Error::Api(format!(
+            return Err(Error::from_message(format!(
                 "get_plug_status failed (result={}) {}",
                 parsed.result,
                 parsed.message.as_deref().unwrap_or("")
@@ -91,10 +91,10 @@ impl PlugApi {
             .bearer_auth(access_token)
             .send()?;
         let text = resp.text()?;
-        let parsed: SetResp = serde_json::from_str(&text)
-            .map_err(|e| Error::BadBody { body: text.clone(), source: e })?;
+        let parsed: SetResp =
+            serde_json::from_str(&text).map_err(|e| Error::bad_body(text.clone(), e))?;
         if parsed.result != 0 {
-            return Err(Error::Api(format!(
+            return Err(Error::from_message(format!(
                 "set_plug_status failed (result={}) {}",
                 parsed.result,
                 parsed.message.as_deref().unwrap_or("")

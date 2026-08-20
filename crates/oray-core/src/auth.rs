@@ -99,10 +99,8 @@ impl AuthApi {
         let status = resp.status();
         let text = resp.text()?;
         if status.as_u16() == 202 {
-            let alert: NewDeviceAlert = serde_json::from_str(&text).map_err(|e| Error::BadBody {
-                body: text.clone(),
-                source: e,
-            })?;
+            let alert: NewDeviceAlert =
+                serde_json::from_str(&text).map_err(|e| Error::bad_body(text.clone(), e))?;
             return Ok(LoginOutcome::NewDevice(alert));
         }
         if !status.is_success() {
@@ -112,10 +110,8 @@ impl AuthApi {
                 body: text,
             });
         }
-        let parsed: AuthResponse = serde_json::from_str(&text).map_err(|e| Error::BadBody {
-            body: text.clone(),
-            source: e,
-        })?;
+        let parsed: AuthResponse =
+            serde_json::from_str(&text).map_err(|e| Error::bad_body(text.clone(), e))?;
         Ok(LoginOutcome::Tokens(parsed))
     }
 
@@ -205,10 +201,7 @@ fn parse_token_resp(resp: reqwest::blocking::Response) -> Result<AuthResponse> {
             body: text,
         });
     }
-    serde_json::from_str(&text).map_err(|e| Error::BadBody {
-        body: text.clone(),
-        source: e,
-    })
+    serde_json::from_str(&text).map_err(|e| Error::bad_body(text.clone(), e))
 }
 
 /// md5 (lowercase hex) of a string.
