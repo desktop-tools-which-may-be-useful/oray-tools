@@ -31,9 +31,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Authenticate and persist tokens
+    /// Authenticate and persist tokens (a fresh device may prompt for an SMS code)
     Login {
+        /// Oray account (mobile number or email)
         account: String,
+        /// Account password (stored locally as md5)
         password: String,
     },
     /// Renew tokens with refresh_token and persist them
@@ -46,6 +48,9 @@ enum Command {
     Plug {
         #[command(subcommand)]
         sub: PlugCmd,
+        /// On server-side TOKEN_EXPIRED, refresh the token and retry once
+        #[arg(long, global = true)]
+        refresh_on_expired: bool,
     },
 }
 
@@ -55,11 +60,16 @@ enum PlugCmd {
     List,
     /// Register a plug (name maps to a device SN)
     Add {
+        /// Name to refer to this plug by
         name: String,
+        /// Device serial number (SN)
         sn: String,
     },
     /// Remove a configured plug
-    Remove { name: String },
+    Remove {
+        /// Plug name registered with `plug add`
+        name: String,
+    },
     /// Query plug status
     Status {
         /// Plug name (defaults to `default` or the only configured plug)
@@ -67,27 +77,22 @@ enum PlugCmd {
         /// Port index (default: 0)
         #[arg(long)]
         index: Option<usize>,
-        /// On server-side TOKEN_EXPIRED, refresh the token and retry once
-        #[arg(long)]
-        refresh_on_expired: bool,
     },
     /// Turn the plug on
     On {
+        /// Plug name (defaults to `default` or the only configured plug)
         name: Option<String>,
+        /// Port index (default: 0)
         #[arg(long)]
         index: Option<usize>,
-        /// On server-side TOKEN_EXPIRED, refresh the token and retry once
-        #[arg(long)]
-        refresh_on_expired: bool,
     },
     /// Turn the plug off
     Off {
+        /// Plug name (defaults to `default` or the only configured plug)
         name: Option<String>,
+        /// Port index (default: 0)
         #[arg(long)]
         index: Option<usize>,
-        /// On server-side TOKEN_EXPIRED, refresh the token and retry once
-        #[arg(long)]
-        refresh_on_expired: bool,
     },
 }
 
@@ -123,7 +128,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Refresh => do_refresh(&http, &mut cfg, &path, cli.clientid.as_deref()),
         Command::Tokens => do_tokens(&cfg),
         Command::Logout => do_logout(&mut cfg, &path),
-        Command::Plug { sub } => do_plug(&http, &mut cfg, &path, sub),
+        Command::Plug { sub, refresh_on_expired } => do_plug(&http, &mut cfg, &path, sub, refresh_on_expired),
     }
 }
 
@@ -258,6 +263,7 @@ fn do_plug(
     cfg: &mut Config,
     path: &PathBuf,
     sub: PlugCmd,
+    refresh_on_expired: bool,
 ) -> Result<()> {
     match sub {
         PlugCmd::List => {
@@ -288,13 +294,13 @@ fn do_plug(
             cfg.save(path)?;
             println!("plug '{name}' removed");
         }
-        PlugCmd::Status { name, index, refresh_on_expired } => {
+        PlugCmd::Status { name, index } => {
             do_plug_action(http, cfg, path, name.as_deref(), index, PlugAction::Status, refresh_on_expired)?
         }
-        PlugCmd::On { name, index, refresh_on_expired } => {
+        PlugCmd::On { name, index } => {
             do_plug_action(http, cfg, path, name.as_deref(), index, PlugAction::On, refresh_on_expired)?
         }
-        PlugCmd::Off { name, index, refresh_on_expired } => {
+        PlugCmd::Off { name, index } => {
             do_plug_action(http, cfg, path, name.as_deref(), index, PlugAction::Off, refresh_on_expired)?
         }
     }

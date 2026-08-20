@@ -8,8 +8,8 @@ tokens in a local config file, and switch plugs from a terminal.
 - `login` — authenticate with account/password and persist tokens; handles the
   SMS verification flow used when registering a new trusted device
 - `refresh` — renew tokens with the saved `refresh_token`
-- `plug status / on / off` — query and switch plugs (auto-refreshes the token
-  when the access token has expired)
+- `plug status / on / off` — query and switch plugs (add `--refresh-on-expired`
+  to refresh the token and retry when the server reports `TOKEN_EXPIRED`)
 - `plug add / remove / list` — manage multiple plugs (each name maps to a device SN)
 - Per-operation `--index` for multi-port plugs, global `--config`/`--clientid`
 - Machine-local trusted client ID (persisted, no hardcoded value)
@@ -128,7 +128,7 @@ oray-tools login <account> <password>      # first run on a device may prompt fo
 oray-tools refresh                         # renew tokens
 oray-tools tokens                          # show token info and expiry
 oray-tools plug add <name> <sn>            # register a plug by device SN
-oray-tools plug status [name] [--index N]
+oray-tools plug status [name] [--index N]  # --refresh-on-expired: refresh+retry on TOKEN_EXPIRED
 oray-tools plug on <name>                  # or: plug off
 oray-tools plug list
 oray-tools logout
