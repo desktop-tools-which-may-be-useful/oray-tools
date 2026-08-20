@@ -178,7 +178,14 @@ jobs:
           done
           cp pool/*.exe "$STAGE/windows-x86_64.exe"
 
-          NOTES="Built from \`${GITHUB_SHA::12}\`. See the JSON indexes under /releases.json, /latest.json, /unstable.json."
+          OWNER="${REPO%%/*}"
+          PROJECT="${REPO##*/}"
+          PAGES="https://${OWNER}.github.io/${PROJECT}"
+          NOTES="Built from \`${GITHUB_SHA::12}\`. See the JSON indexes:
+          - ${PAGES}/manifest.json — manifest of the build just published
+          - ${PAGES}/latest.json — alias of manifest.json (latest build)
+          - ${PAGES}/unstable.json — alias of manifest.json (unstable build)
+          - ${PAGES}/releases.json — formal releases, newest first"
 
           if [ "$MAKE_RELEASE" = "true" ]; then
             TAG="v${VERSION}"
