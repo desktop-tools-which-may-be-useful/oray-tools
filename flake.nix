@@ -2,7 +2,7 @@
   description = "oray-tools: CLI tool for Oray smart plug control";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/e7a3ca8092b61ff85b6a45bf863ea2b2d6a661b3";
+    nixpkgs.url = "github:NixOS/nixpkgs/1559d3daa3ecc813a650b79375ea61b6741b8746";
   };
 
   outputs =
