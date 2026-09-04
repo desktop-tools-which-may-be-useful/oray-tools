@@ -1,17 +1,26 @@
 # oray-tools
 
-Command-line control of Oray smart plugs. Auth via the device's API, persist
-tokens in a local config file, and switch plugs from a terminal.
+Command-line control of Oray (Sunlogin) devices. The CLI is a thin wrapper
+over the Oray cloud APIs: only authentication material is stored locally;
+every device list/info/status is fetched live from the cloud on each command.
 
 ## Features
 
-- `login` — authenticate with account/password and persist tokens; handles the
-  SMS verification flow used when registering a new trusted device
-- `refresh` — renew tokens with the saved `refresh_token`
-- `plug status / on / off` — query and switch plugs (add `--refresh-on-expired`
-  to refresh the token and retry when the server reports `TOKEN_EXPIRED`)
-- `plug add / remove / list` — manage multiple plugs (each name maps to a device SN)
-- Per-operation `--index` for multi-port plugs, global `--config`/`--clientid`
+- `auth login` — authenticate with account/password and persist tokens;
+  handles the SMS-verification flow used when registering a new trusted device
+- `auth refresh / status / logout` — renew tokens, show expiry, clear local state
+- `wakeup` — **开机设备** (smart plugs / power hardware), from `/wakeup/devices`:
+  - `list`, `info <sn>`, `rename`, `memo`
+  - `plug status / on / off [--index N]` — query and switch an outlet
+  - `plug logs` — status-change history (paged, or filtered by `--since`)
+  - `plug timer list/add/remove` and `plug countdown status/start/stop`
+  - `plug led on|off`, `plug power-on-restore <0|2>`
+- `remote` — **远程设备** (PCs / phones), from `/remotes`:
+  - `list`, `info <id>`, `status <id>`, `rename`, `memo`
+- Machine-readable output: every command accepts `--json`
+- Debug output: every command accepts `--verbose` (raw request/response on stderr)
+- `--refresh-on-expired` on `wakeup`/`remote` refreshes the token and retries
+  once when the server reports `TOKEN_EXPIRED`
 - Machine-local trusted client ID (persisted, no hardcoded value)
 
 ## Installation
@@ -23,7 +32,7 @@ The project provides a Nix flake (`x86_64-linux`, `aarch64-linux`).
 Run without installing:
 
 ```
-nix run github:desktop-tools-which-may-be-useful/oray-tools -- plug status
+nix run github:desktop-tools-which-may-be-useful/oray-tools -- wakeup list
 ```
 
 Install into the user profile:
@@ -123,24 +132,78 @@ latest `.deb`/`.exe` while history lives in GitHub Releases.
 
 ## Usage
 
+Authentication (stored locally):
+
 ```
-oray-tools login <account> <password>      # first run on a device may prompt for an SMS code
-oray-tools refresh                         # renew tokens
-oray-tools tokens                          # show token info and expiry
-oray-tools plug add <name> <sn>            # register a plug by device SN
-oray-tools plug status [name] [--index N]  # --refresh-on-expired: refresh+retry on TOKEN_EXPIRED
-oray-tools plug on <name>                  # or: plug off
-oray-tools plug list
-oray-tools logout
+oray-tools auth login <account> <password>   # first run on a device may prompt for an SMS code
+oray-tools auth refresh                      # renew tokens
+oray-tools auth status                       # show token info and expiry (--json)
+oray-tools auth logout                       # clear saved tokens and account
 ```
 
+Wakeup devices — smart plugs / power hardware (all data from the cloud):
+
+```
+oray-tools wakeup list                        # list devices
+oray-tools wakeup info <sn>                   # device details
+oray-tools wakeup rename <sn> <new-name>      # rename (keeps the memo)
+oray-tools wakeup memo <sn> <text>            # set the memo/备注 (keeps the name)
+
+oray-tools wakeup plug status <sn> [--index N]            # query outlet state
+oray-tools wakeup plug on <sn> [--index N]                # switch on
+oray-tools wakeup plug off <sn> [--index N]               # switch off
+oray-tools wakeup plug logs <sn> [--since 2h|--page N]    # status history
+oray-tools wakeup plug timer list <sn>                    # list timers
+oray-tools wakeup plug timer add <sn> --time 480 --action 1 --repeat 31  # LOCAL 08:00, Mon-Fri (bit0=Mon..bit6=Sun, 0=once); plug stores UTC, tool converts
+oray-tools wakeup plug timer remove <sn> <timer-id>
+oray-tools wakeup plug timer enable <sn> <timer-id>       # activate a timer
+oray-tools wakeup plug timer disable <sn> <timer-id>      # pause a timer (kept, inactive)
+oray-tools wakeup plug countdown status <sn>              # show running countdown
+oray-tools wakeup plug countdown start <sn> --count 600 --action 0
+oray-tools wakeup plug countdown stop <sn>
+oray-tools wakeup plug led <sn> on|off                    # LED indicator
+oray-tools wakeup plug power-on-restore <sn> <0|2>        # state after power loss
+```
+
+Remote devices — PCs / phones (all data from the cloud):
+
+```
+oray-tools remote list                       # list remotes
+oray-tools remote info <id>                  # extended detail
+oray-tools remote status <id>                # online state / last seen
+oray-tools remote rename <id> <new-name>     # rename (keeps the memo)
+oray-tools remote memo <id> <text>           # set the memo (keeps the name)
+```
+
+Every command accepts `--json` for machine-readable output and `--verbose`
+to print the raw HTTP request/response on stderr. Add `--refresh-on-expired`
+to any `wakeup`/`remote` command to auto-refresh the access token and retry
+once when the server reports `TOKEN_EXPIRED`.
+
 `oray-tools <COMMAND> --help` shows command-specific options.
+
+Example:
+
+```
+$ oray-tools wakeup list --json
+{
+  "devices": [
+    {
+      "device_id": 900001,
+      "sn": "100000000001",
+      "name": "Demo Smart Plug",
+      "device_type": "sl_smartplug",
+      "outletcount": 1
+    }
+  ]
+}
+```
 
 ## Configuration
 
 Config is stored in `$XDG_CONFIG_HOME/oray-tools/config.toml`
-(`~/.config/oray-tools/config.toml`). It holds account credentials, tokens,
-the trusted client ID, and plug SNs:
+(`~/.config/oray-tools/config.toml`). Only authentication material lives
+there — no device data is cached:
 
 ```toml
 [account]
@@ -155,25 +218,33 @@ access_token = "..."
 refresh_token = "..."
 refresh_expires = ...
 
-[plugs.main]
-sn = "560056660997"
-
 [server]
 # api_base    = "https://api-std.sunlogin.oray.com"   # defaults
 # slapi_base  = "https://slapi.oray.net"
+
+# Timezone of the plug for timer scheduling, same format as --tz
+# (e.g. "+08:00" for China, "-05:00", or plain minutes like "480").
+# When unset the CLI falls back to the machine's local offset and warns.
+tz = "+08:00"
 ```
 
 Use `--config <path>` to point at a different file and `--clientid <id>` to
-override the trusted client ID for a single run.
+override the trusted client ID for a single run. `--tz <offset>` overrides the
+timezone for a single run and accepts the same formats as the config value
+(e.g. `--tz +8`, `--tz -05:30`, or `--tz 480`).
 
 ## Development
 
 The project is a Cargo workspace with two crates:
 
 - `crates/oray-core` — the protocol layer only, no filesystem/CLI surface.
-  `AuthApi` and `PlugApi` are stateless HTTP clients (login/refresh/
-  SMS-verification and device status/switch). The `reqwest` client, network
-  errors (`oray_core::Error`) and all state are owned by the caller.
+  Stateless HTTP clients over the Oray cloud APIs:
+  - `auth` — login/refresh/SMS-verification token flow
+  - `wakeup` — `/wakeup/devices` listing (`WakeupApi`)
+  - `plug` — smart-plug controls on `slapi.oray.net` (`PlugApi`)
+  - `remote` — remote devices on `api-std` (`RemoteApi`)
+  - `output` — verbose request/response logging switch
+  Network errors (`oray_core::Error`) and all state are owned by the caller.
 - `crates/oray-cli` — the `oray-tools` binary: clap argument parsing, command
   dispatch, persisted config (`config.rs`), token lifecycle and client-id
   management (`token.rs`). It injects a shared HTTP client into the core APIs

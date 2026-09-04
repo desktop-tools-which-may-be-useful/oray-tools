@@ -73,7 +73,9 @@ fn client_id(cfg: &mut Config) -> String {
         return cid;
     }
     let cid = oray_core::auth::generate_client_id();
-    cfg.client = Some(Client { clientid: cid.clone() });
+    cfg.client = Some(Client {
+        clientid: cid.clone(),
+    });
     cid
 }
 
@@ -87,14 +89,14 @@ pub fn ensure_token(
     force: bool,
 ) -> Result<Token> {
     if cfg.account.is_none() {
-        bail!("no account configured; run `oray-tools login`");
+        bail!("no account configured; run `oray-tools auth login`");
     }
     let current = cfg.token.clone().unwrap_or_default();
     if !force && !current.access_token.is_empty() && !is_access_expired(&current.access_token) {
         return Ok(current);
     }
     if current.refresh_token.is_empty() {
-        bail!("no valid access token and no refresh token; run `oray-tools login`");
+        bail!("no valid access token and no refresh token; run `oray-tools auth login`");
     }
     let server = cfg.server();
     let api = AuthApi::new(http.clone(), &server.api_base);

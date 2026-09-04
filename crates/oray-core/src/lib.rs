@@ -1,5 +1,10 @@
 pub mod auth;
-pub mod plug;
+pub mod output;
+pub mod remote;
+pub mod wakeup;
+
+/// User-Agent accepted by the api-std endpoints (they reject unknown formats).
+pub const USER_AGENT: &str = "SLCC/15.5.8.83635 (Android)";
 
 /// Errors returned by the protocol layer.
 #[derive(Debug, thiserror::Error)]

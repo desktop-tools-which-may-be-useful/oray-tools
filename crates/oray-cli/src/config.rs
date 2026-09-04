@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 pub const DEFAULT_API_BASE: &str = "https://api-std.sunlogin.oray.com";
@@ -22,11 +21,6 @@ pub struct Token {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Device {
-    pub sn: String,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Client {
     pub clientid: String,
 }
@@ -37,18 +31,21 @@ pub struct Server {
     pub slapi_base: String,
 }
 
+/// Local configuration. Only authentication material is stored: account,
+/// trusted client id and tokens. All device data is fetched live from the
+/// cloud API on every command.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     pub account: Option<Account>,
     pub token: Option<Token>,
     pub client: Option<Client>,
-    /// Named plug registry: name -> device.
-    #[serde(default)]
-    pub plugs: HashMap<String, Device>,
-    /// Legacy single-device section, migrated into `plugs` on load.
-    #[serde(default, rename = "device", skip_serializing)]
-    pub legacy_device: Option<Device>,
     pub server: Option<Server>,
+    /// Timezone offset used to interpret plug timer schedule times, in the
+    /// same format as `--tz` (e.g. "+08:00", "-05:30" or "480" minutes).
+    /// When unset the CLI falls back to the machine's local offset (with a
+    /// warning).
+    #[serde(default)]
+    pub tz: Option<String>,
 }
 
 impl Config {
@@ -65,19 +62,17 @@ impl Config {
         if !p.exists() {
             return Ok((Config::default(), p));
         }
-        let raw = std::fs::read_to_string(&p).with_context(|| format!("read config {}", p.display()))?;
-        let mut cfg: Config = toml::from_str(&raw).with_context(|| format!("parse config {}", p.display()))?;
-        if cfg.plugs.is_empty()
-            && let Some(dev) = cfg.legacy_device.take()
-        {
-            cfg.plugs.insert("default".to_string(), dev);
-        }
+        let raw =
+            std::fs::read_to_string(&p).with_context(|| format!("read config {}", p.display()))?;
+        let cfg: Config =
+            toml::from_str(&raw).with_context(|| format!("parse config {}", p.display()))?;
         Ok((cfg, p))
     }
 
     pub fn save(&self, path: &PathBuf) -> Result<()> {
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).with_context(|| format!("create dir {}", dir.display()))?;
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("create dir {}", dir.display()))?;
         }
         let raw = toml::to_string_pretty(self).context("serialize config")?;
         std::fs::write(path, raw).with_context(|| format!("write config {}", path.display()))?;
@@ -112,5 +107,51 @@ impl Server {
                 self.slapi_base.trim_end_matches('/').to_string()
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_plug_sections_are_ignored() {
+        let raw = r#"
+[account]
+account = "demo"
+password_md5 = "abc"
+
+[token]
+access_token = "a"
+refresh_token = "b"
+refresh_expires = 0
+
+[client]
+clientid = "uuid"
+
+[plugs.main]
+sn = "100000000001"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.account.unwrap().account, "demo");
+        assert!(cfg.token.is_some());
+    }
+
+    #[test]
+    fn server_defaults() {
+        let s = Server::default().normalized();
+        assert_eq!(s.api_base, DEFAULT_API_BASE);
+        assert_eq!(s.slapi_base, DEFAULT_SLAPI_BASE);
+    }
+
+    #[test]
+    fn server_trailing_slash_normalized() {
+        let s = Server {
+            api_base: "https://api.example.com/".into(),
+            slapi_base: "".into(),
+        }
+        .normalized();
+        assert_eq!(s.api_base, "https://api.example.com");
+        assert_eq!(s.slapi_base, DEFAULT_SLAPI_BASE);
     }
 }

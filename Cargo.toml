@@ -4,7 +4,7 @@ members = ["crates/oray-core", "crates/oray-cli"]
 default-members = ["crates/oray-cli"]
 
 [workspace.package]
-version = "0.2.7"
+version = "1.0.0"
 edition = "2024"
 
 [workspace.dependencies]

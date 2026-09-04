@@ -20,19 +20,22 @@
         {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "oray-tools";
-            version = "0.2.5";
+            version = "1.0.0";
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
             meta = with pkgs.lib; {
-              description = "Oray smart plug control CLI";
+              description = "Oray (Sunlogin) device control CLI";
               longDescription = ''
-                oray-tools provides command-line control of Oray smart plugs:
-                - login: authenticate and persist tokens (supports the SMS
-                  verification flow used when registering a new trusted device)
-                - refresh: renew tokens using refresh_token
-                - status / on / off: query and switch a plug (auto-refreshes
-                  when the access token is expired)
-                - tokens / logout: show token info / clear saved state
+                oray-tools provides command-line control of Oray (Sunlogin)
+                devices through the cloud APIs:
+                - auth login/refresh/status/logout: manage locally stored tokens
+                - wakeup list/info/rename/memo: 开机设备 (smart plugs, power
+                  hardware), fetched live from the cloud
+                - wakeup plug status/on/off/logs/timer/countdown/led/
+                  power-on-restore: smart-plug controls
+                - remote list/info/status/rename/memo: 远程设备 (PCs, phones)
+                - --json / --verbose output on every command, plus
+                  --refresh-on-expired to auto-refresh tokens on TOKEN_EXPIRED
                 Config is stored in $XDG_CONFIG_HOME/oray-tools/config.toml.
               '';
               homepage = "https://github.com/desktop-tools-which-may-be-useful/oray-tools";

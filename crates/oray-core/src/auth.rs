@@ -75,12 +75,7 @@ impl AuthApi {
     }
 
     /// Authenticate with `password` already md5-hashed (hex, lowercase).
-    pub fn login(
-        &self,
-        clientid: &str,
-        account: &str,
-        password_md5: &str,
-    ) -> Result<LoginOutcome> {
+    pub fn login(&self, clientid: &str, account: &str, password_md5: &str) -> Result<LoginOutcome> {
         let url = format!("{}/authorization", self.api_base);
         let body = json!({
             "type": ACCOUNT_TYPE,
