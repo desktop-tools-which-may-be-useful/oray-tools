@@ -156,12 +156,14 @@ oray-tools wakeup plug status <sn> [--index N]            # query outlet state
 oray-tools wakeup plug on <sn> [--index N]                # switch on
 oray-tools wakeup plug off <sn> [--index N]               # switch off
 oray-tools wakeup plug logs <sn> [--since 2h] [--until 6h] [--page N] # status history
-# --since/--until bound the window (ago like 2h/1d, or absolute local time
-# like 2026-09-03 or 2026-09-03 09:00[:00]); a bare date runs to the day's
-# end for --until. The server has no time-window query, so the CLI locates
-# the pages that can match (binary search) and filters locally.
+# --since/--until bound the window (ago like 2h/1d, or an absolute time like
+# 2026-09-03 or 2026-09-03 09:00[:00]); a bare date runs to the day's end for
+# --until. Absolute times are read in the plug's timezone (--tz / config tz,
+# else machine local), and every printed time carries that zone (e.g. "... 10:07:18 UTC+08:00").
+# The server has no time-window query, so the CLI locates the pages that can
+# match (binary search) and filters locally.
 oray-tools wakeup plug timer list <sn>                    # list timers
-oray-tools wakeup plug timer add <sn> --time 480 --action 1 --repeat 31  # LOCAL 08:00, Mon-Fri (bit0=Mon..bit6=Sun, 0=once); plug stores UTC, tool converts
+oray-tools wakeup plug timer add <sn> --time 08:00 --action 1 --repeat 31  # LOCAL 08:00, Mon-Fri (bit0=Mon..bit6=Sun, 0=once); minutes also accepted (--time 480); plug stores UTC, tool converts
 oray-tools wakeup plug timer remove <sn> <timer-id>
 oray-tools wakeup plug timer enable <sn> <timer-id>       # activate a timer
 oray-tools wakeup plug timer disable <sn> <timer-id>      # pause a timer (kept, inactive)
@@ -231,8 +233,10 @@ refresh_expires = ...
 # api_base    = "https://api-std.sunlogin.oray.com"   # defaults
 # slapi_base  = "https://slapi.oray.net"
 
-# Timezone of the plug for timer scheduling, same format as --tz
-# (e.g. "+08:00" for China, "-05:00", or plain minutes like "480").
+# Timezone of the plug for timer scheduling and for absolute `logs
+# --since/--until` windows / displayed times, same format as --tz
+# (e.g. "+8h" for China, "-5h", "+480min", "+08:00", "-08:20"; a sign is
+# always required).
 # When unset the CLI falls back to the machine's local offset and warns.
 tz = "+08:00"
 ```
@@ -240,7 +244,7 @@ tz = "+08:00"
 Use `--config <path>` to point at a different file and `--clientid <id>` to
 override the trusted client ID for a single run. `--tz <offset>` overrides the
 timezone for a single run and accepts the same formats as the config value
-(e.g. `--tz +8`, `--tz -05:30`, or `--tz 480`).
+(e.g. `--tz +8h`, `--tz -05:30`, or `--tz +480min`).
 
 ## Development
 

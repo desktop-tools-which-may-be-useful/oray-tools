@@ -8,7 +8,10 @@
 //! between the two representations given a timezone offset in minutes.
 
 use crate::config::Config;
-use crate::support::{emit_json, parse_on_off, resolve_time_bound, resolve_tz, with_token};
+use crate::support::{
+    emit_json, parse_ago_secs, parse_on_off, render_ts, resolve_time_bound_tz, resolve_tz,
+    tz_label, with_token,
+};
 use anyhow::{Result, bail};
 use chrono::Utc;
 use clap::Subcommand;
@@ -177,8 +180,9 @@ pub enum PlugCmd {
         #[arg(long, default_value_t = 0)]
         index: usize,
         /// Lower bound: only events at or after this. Either an ago duration
-        /// (30m, 2h, 1d) or an absolute local time (2026-09-01, or
-        /// 2026-09-01 08:30[:00]); a bare date means the start of that day.
+        /// (30m, 2h, 1d) or an absolute time (2026-09-01, or 2026-09-01
+        /// 08:30[:00]); a bare date means the start of that day. Absolute
+        /// times use the timezone from --tz / config tz, else machine local.
         #[arg(long)]
         since: Option<String>,
         /// Upper bound: only events at or before this. Same forms as --since;
@@ -234,9 +238,10 @@ pub enum TimerCmd {
         /// Port index (default: 0)
         #[arg(long, default_value_t = 0)]
         index: usize,
-        /// Local minutes of the day (0-1439) when the timer fires, e.g. 480 = 08:00
+        /// Local time when the timer fires: a clock time like 19:25 (or
+        /// 8:05), or minutes of the day 0-1439 (e.g. 480 = 08:00)
         #[arg(long)]
-        time: u64,
+        time: String,
         /// Resulting state: 0 = off, 1 = on (default: 1)
         #[arg(long, default_value_t = 1)]
         action: u8,
@@ -368,12 +373,30 @@ pub fn run(
             page,
         } => {
             let now = Utc::now().timestamp();
+            // Absolute wall-clock bounds are interpreted in the plug's
+            // timezone (--tz > config tz > machine local); ago bounds are
+            // duration math on `now` and need no timezone.
+            let absolute = since
+                .as_deref()
+                .is_some_and(|s| parse_ago_secs(s).is_none())
+                || until
+                    .as_deref()
+                    .is_some_and(|u| parse_ago_secs(u).is_none());
+            let tz_min = absolute.then(|| resolve_tz(cfg, tz)).transpose()?;
+            // Rendering timezone: an explicit --tz/config tz always wins;
+            // otherwise reuse the offset already resolved for an absolute
+            // window (so displayed times match the bounds), else machine local.
+            let display_tz = if tz.is_some() || cfg.tz.is_some() {
+                Some(resolve_tz(cfg, tz)?)
+            } else {
+                tz_min
+            };
             let start = match since {
-                Some(ref s) => Some(resolve_time_bound(s, true, now)?),
+                Some(ref s) => Some(resolve_time_bound_tz(s, true, now, tz_min)?),
                 None => None,
             };
             let end = match until {
-                Some(ref u) => Some(resolve_time_bound(u, false, now)?),
+                Some(ref u) => Some(resolve_time_bound_tz(u, false, now, tz_min)?),
                 None => None,
             };
             if let (Some(start), Some(end)) = (start, end)
@@ -492,13 +515,30 @@ pub fn run(
                     }
                 }
             }
-            emit_json(json, &all)?;
-            if !json {
+            if json {
+                let arr: Vec<serde_json::Value> = all
+                    .iter()
+                    .map(|l| {
+                        let mut value = serde_json::to_value(l).unwrap_or(serde_json::Value::Null);
+                        if let Some(obj) = value.as_object_mut() {
+                            obj.insert(
+                                "createtime_tz".to_string(),
+                                serde_json::Value::String(render_ts(l.createtime, display_tz)),
+                            );
+                        }
+                        value
+                    })
+                    .collect();
+                emit_json(true, &arr)?;
+            } else {
                 for l in all {
                     let state = if l.status == 1 { "ON" } else { "OFF" };
                     println!(
                         "{} index={} {} {}",
-                        l.createtime_format, l.index, state, l.event
+                        render_ts(l.createtime, display_tz),
+                        l.index,
+                        state,
+                        l.event
                     );
                 }
             }
@@ -563,6 +603,7 @@ fn do_timer(
                 })
                 .collect();
             if json {
+                let tz_name = tz_label(tz);
                 let arr: Vec<serde_json::Value> = rows
                     .iter()
                     .map(|(t, time, repeat)| {
@@ -574,6 +615,7 @@ fn do_timer(
                             "repeat": repeat,
                             "days": mask_days(*repeat),
                             "enabled": t.enabled,
+                            "tz": tz_name,
                         })
                     })
                     .collect();
@@ -593,11 +635,12 @@ fn do_timer(
                     _ => "disabled",
                 };
                 println!(
-                    "sn={sn} index={index} timer_id={id} time={:02}:{:02} days={} action={} {state}",
+                    "sn={sn} index={index} timer_id={id} time={:02}:{:02} days={} action={} {state} ({})",
                     time / 60,
                     time % 60,
                     mask_days(*repeat),
-                    t.action.unwrap_or(0)
+                    t.action.unwrap_or(0),
+                    tz_label(tz)
                 );
             }
             Ok(())
@@ -613,9 +656,11 @@ fn do_timer(
             if action > 1 {
                 bail!("timer action must be 0 (off) or 1 (on)");
             }
-            if time > 1439 {
-                bail!("timer time must be local minutes of the day (0-1439), got {time}");
-            }
+            let time = crate::support::parse_local_time(&time).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid --time '{time}': use a local clock time like 19:25, or minutes of the day 0-1439 (e.g. 480 = 08:00)"
+                )
+            })?;
             let tz = resolve_tz(cfg, tz_arg)?;
             let timer = PlugTimer {
                 timer_id: None,
@@ -634,12 +679,13 @@ fn do_timer(
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "-".into());
                 println!(
-                    "sn={sn} index={index} timer added: id={id} time={:02}:{:02} days={} action={} {}",
+                    "sn={sn} index={index} timer added: id={id} time={:02}:{:02} days={} action={} {} ({})",
                     time / 60,
                     time % 60,
                     mask_days(repeat),
                     action,
-                    if disabled { "disabled" } else { "enabled" }
+                    if disabled { "disabled" } else { "enabled" },
+                    tz_label(tz)
                 );
             }
             Ok(())

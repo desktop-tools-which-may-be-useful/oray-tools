@@ -43,9 +43,10 @@ struct Cli {
     #[arg(long, global = true)]
     trace_raw: bool,
 
-    /// Timezone offset for plug timers, e.g. 480 / +8 / -05:30. Defaults to
-    /// config `tz`, else the machine's local offset (with a warning)
-    #[arg(long, global = true)]
+    /// Timezone offset for plug timers / log windows, e.g. +8h, -5h, +480min,
+    /// +08:00, -08:20 (a sign is required). Defaults to config `tz`, else the
+    /// machine's local offset (with a warning)
+    #[arg(long, global = true, allow_hyphen_values = true)]
     tz: Option<String>,
 }
 
@@ -102,7 +103,7 @@ fn run(cli: Cli) -> Result<()> {
     let tz = match cli.tz.as_deref() {
         Some(s) => Some(support::parse_tz(s).ok_or_else(|| {
             anyhow::anyhow!(
-                "invalid --tz '{s}' (use minutes like 480 or ±HH[:MM] like +8 / -05:30)"
+                "invalid --tz '{s}' (use a signed offset like +8h / -5h / +480min / +08:00 / -08:20)"
             )
         })?),
         None => None,
