@@ -1,10 +1,96 @@
 //! Shared helpers for the command handlers (token lifecycle, output, parsing).
+//!
+//! All presentation — the `--verbose`/`--trace-raw` request rendering, the
+//! `--json` output and human text — is owned by this CLI layer. The protocol
+//! layer only returns request/response traces as data.
 
 use crate::config::Config;
 use anyhow::{Result, bail};
+use oray_core::trace::{RequestLog, TracedResult};
 use reqwest::blocking::Client as HttpClient;
 use serde::Serialize;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Whether `--verbose` (detailed request rendering on stderr) is on.
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+/// Whether `--trace-raw` disables masking of sensitive trace values.
+static RAW_TRACE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_verbose(enabled: bool) {
+    VERBOSE.store(enabled, Ordering::Relaxed);
+}
+
+pub fn verbose() -> bool {
+    VERBOSE.load(Ordering::Relaxed)
+}
+
+pub fn set_raw_trace(enabled: bool) {
+    RAW_TRACE.store(enabled, Ordering::Relaxed);
+}
+
+pub fn raw_trace() -> bool {
+    RAW_TRACE.load(Ordering::Relaxed)
+}
+
+/// Truncate a body for display (mirrors the CLI's classic `--verbose` view).
+fn display_body(body: &str) -> String {
+    let body = body.trim();
+    if body.len() > 4096 {
+        format!("{}…", &body[..4096])
+    } else {
+        body.to_string()
+    }
+}
+
+fn print_request_log(call: &RequestLog) {
+    eprintln!("[DEBUG] {} {}", call.method, call.url);
+    for (name, value) in &call.request_headers {
+        eprintln!("[DEBUG] {name}: {value}");
+    }
+    if let Some(body) = &call.request_body {
+        eprintln!("[DEBUG] Request body: {}", display_body(body));
+    }
+    match call.status {
+        Some(status) => eprintln!("[DEBUG] Response: {status}"),
+        None => eprintln!("[DEBUG] Response: <no response>"),
+    }
+    if !call.response_body.is_empty() {
+        eprintln!("[DEBUG] Body: {}", display_body(&call.response_body));
+    }
+}
+
+/// Render captured request/response exchanges on stderr when `--verbose` is
+/// set. Values are masked by default; `--trace-raw` shows them verbatim.
+pub fn emit_traces(calls: &[RequestLog]) {
+    if !verbose() || calls.is_empty() {
+        return;
+    }
+    for call in calls {
+        if raw_trace() {
+            print_request_log(call);
+        } else {
+            print_request_log(&call.redacted());
+        }
+    }
+}
+
+/// Run a `TracedResult` to completion at the presentation layer: print its
+/// exchanges when `--verbose` is set, then unwrap the data or the error.
+/// Used by command paths that talk to the protocol layer directly (the auth
+/// flow), where `with_token` is not involved.
+pub fn traced<T>(label: &str, r: TracedResult<T>) -> Result<T> {
+    match r {
+        Ok(traced) => {
+            emit_traces(&traced.calls);
+            Ok(traced.data)
+        }
+        Err(e) => {
+            emit_traces(&e.calls);
+            Err(anyhow::anyhow!("{label}: {e}"))
+        }
+    }
+}
 
 /// Print a value as pretty JSON when `json` is set.
 pub fn emit_json(json: bool, value: &impl Serialize) -> Result<()> {
@@ -15,23 +101,40 @@ pub fn emit_json(json: bool, value: &impl Serialize) -> Result<()> {
 }
 
 /// Run an authenticated closure, refreshing the token once on `TOKEN_EXPIRED`
-/// when `refresh_on_expired` is set.
+/// when `refresh_on_expired` is set. Traces from the refresh and the operation
+/// itself are rendered on stderr when `--verbose` is on.
 pub fn with_token<T>(
     http: &HttpClient,
     cfg: &mut Config,
     path: &PathBuf,
     refresh_on_expired: bool,
-    run: impl Fn(&str) -> oray_core::Result<T>,
+    run: impl Fn(&str) -> TracedResult<T>,
 ) -> Result<T> {
     let mut token = crate::token::ensure_token(http, cfg, path, false)?;
     match run(&token.access_token) {
-        Ok(v) => Ok(v),
-        Err(oray_core::Error::TokenExpired(_)) if refresh_on_expired => {
+        Ok(traced) => {
+            emit_traces(&traced.calls);
+            Ok(traced.data)
+        }
+        Err(e) if e.is_token_expired() && refresh_on_expired => {
+            emit_traces(&e.calls);
             eprintln!("access token expired; refreshing and retrying...");
             token = crate::token::ensure_token(http, cfg, path, true)?;
-            run(&token.access_token).map_err(Into::into)
+            match run(&token.access_token) {
+                Ok(traced) => {
+                    emit_traces(&traced.calls);
+                    Ok(traced.data)
+                }
+                Err(e) => {
+                    emit_traces(&e.calls);
+                    Err(e.into())
+                }
+            }
         }
-        Err(e) => Err(e.into()),
+        Err(e) => {
+            emit_traces(&e.calls);
+            Err(e.into())
+        }
     }
 }
 
@@ -131,8 +234,7 @@ pub fn resolve_tz(cfg: &Config, arg: Option<i64>) -> Result<i64> {
         return Ok(min);
     }
     if let Some(s) = &cfg.tz {
-        return parse_tz(s)
-            .ok_or_else(|| anyhow::anyhow!("invalid `tz` in config: '{s}'"));
+        return parse_tz(s).ok_or_else(|| anyhow::anyhow!("invalid `tz` in config: '{s}'"));
     }
     let min = machine_offset_min();
     eprintln!(

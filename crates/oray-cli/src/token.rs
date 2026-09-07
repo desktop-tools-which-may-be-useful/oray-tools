@@ -1,5 +1,5 @@
 use crate::config::{Client, Config, Token};
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use base64::Engine;
 use oray_core::auth::{AuthApi, AuthResponse};
 use reqwest::blocking::Client as HttpClient;
@@ -101,9 +101,10 @@ pub fn ensure_token(
     let server = cfg.server();
     let api = AuthApi::new(http.clone(), &server.api_base);
     let cid = client_id(cfg);
-    let refreshed = api
-        .refresh(&cid, &current.access_token, &current.refresh_token)
-        .context("refresh access token")?;
+    let refreshed = crate::support::traced(
+        "refresh access token",
+        api.refresh(&cid, &current.access_token, &current.refresh_token),
+    )?;
     let expiry = refresh_expiry(&refreshed);
     let token = Token {
         access_token: refreshed.access_token,

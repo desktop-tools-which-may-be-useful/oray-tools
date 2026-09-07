@@ -5,8 +5,8 @@
 
 pub mod plug;
 
-use crate::output::{log_auth_header, log_request, log_response};
-use crate::{Error, Result};
+use crate::Error;
+use crate::trace::{self, RawResult, RequestLog, Traced, TracedError, TracedResult};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 
@@ -90,44 +90,69 @@ impl WakeupApi {
         }
     }
 
+    fn send(
+        &self,
+        token: &str,
+        what: &'static str,
+        url: &str,
+    ) -> RawResult<(Vec<RequestLog>, String)> {
+        let headers = vec![
+            ("Authorization".into(), format!("Bearer {token}")),
+            ("Accept".into(), "application/json".into()),
+            ("User-Agent".into(), crate::USER_AGENT.into()),
+            ("X-Channel".into(), "OPPO".into()),
+            ("Country-Region".into(), "CN".into()),
+        ];
+        let ex = trace::execute(
+            &self.client,
+            trace::Request {
+                method: "GET",
+                url: url.to_string(),
+                headers,
+                body: None,
+            },
+        )?;
+        if !(200..300).contains(&ex.status) {
+            return Err(TracedError {
+                error: Error::HttpStatus {
+                    what,
+                    status: ex.status,
+                    body: ex.text,
+                },
+                calls: vec![ex.log],
+            });
+        }
+        Ok((vec![ex.log], ex.text))
+    }
+
     /// List all wakeup-capable devices. Optionally filter to one SN
     /// (`/wakeup/devices?sn=<sn>`).
-    pub fn list(&self, token: &str, sn: Option<&str>) -> Result<WakeupDevicesResponse> {
+    pub fn list(&self, token: &str, sn: Option<&str>) -> TracedResult<WakeupDevicesResponse> {
         let mut url = format!("{}/wakeup/devices?offset=0&limit=100", self.api_base);
         if let Some(sn) = sn {
             url = format!("{url}&sn={sn}");
         }
-        log_request("GET", &url);
-        let resp = self
-            .client
-            .get(&url)
-            .bearer_auth(token)
-            .header("Accept", "application/json")
-            .header("User-Agent", crate::USER_AGENT)
-            .header("X-Channel", "OPPO")
-            .header("Country-Region", "CN")
-            .send()?;
-        log_auth_header("", token);
-        let status = resp.status();
-        let text = resp.text()?;
-        log_response(status.as_u16(), &text);
-        if !status.is_success() {
-            return Err(Error::HttpStatus {
-                what: "list wakeup devices",
-                status: status.as_u16(),
-                body: text,
-            });
-        }
-        serde_json::from_str(&text).map_err(|e| Error::bad_body(text, e))
+        let (calls, text) = self.send(token, "list wakeup devices", &url)?;
+        trace::finish(
+            calls,
+            serde_json::from_str(&text).map_err(|e| Error::bad_body(text, e)),
+        )
     }
 
     /// Look up a single device by SN.
-    pub fn find(&self, token: &str, sn: &str) -> Result<WakeupDevice> {
+    pub fn find(&self, token: &str, sn: &str) -> TracedResult<WakeupDevice> {
         let all = self.list(token, None)?;
-        all.devices
-            .into_iter()
-            .find(|d| d.sn == sn)
-            .ok_or_else(|| Error::Api(format!("wakeup device sn={sn} not found")))
+        let calls = all.calls;
+        match all.data.devices.into_iter().find(|d| d.sn == sn) {
+            Some(device) => Ok(Traced {
+                data: device,
+                calls,
+            }),
+            None => Err(TracedError {
+                error: Error::Api(format!("wakeup device sn={sn} not found")),
+                calls,
+            }),
+        }
     }
 }
 

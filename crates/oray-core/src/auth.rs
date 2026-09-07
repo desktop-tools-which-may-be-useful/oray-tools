@@ -1,5 +1,6 @@
-use crate::{Error, Result};
-use reqwest::blocking::{Client, RequestBuilder};
+use crate::Error;
+use crate::trace::{self, Exchange, RawResult, Traced, TracedError, TracedResult};
+use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -7,6 +8,7 @@ pub const ACCOUNT_TYPE: &str = "password";
 pub const APP_ID: &str = "kNUC97u86Zr7mt9xeZVl";
 /// Salt used to compute the sendcode `checksum`.
 const CHECKSUM_SALT: &str = "sunlogin.oray.com";
+const USER_AGENT: &str = "SLCC/15.5.8.83635 (Android)";
 
 /// Generate a machine-local client id (UUID v4). A fresh id triggers Oray's
 /// one-time SMS verification on first login, after which it is trusted.
@@ -64,18 +66,69 @@ impl AuthApi {
         }
     }
 
-    fn auth_headers(&self, rb: RequestBuilder, clientid: &str) -> RequestBuilder {
-        rb.header("User-Agent", "SLCC/15.5.8.83635 (Android)")
-            .header("X-Channel", "OPPO")
-            .header("X-AppID", APP_ID)
-            .header("EX-ClientId", clientid)
-            .header("Country-Region", "zh-Hans_US")
-            .header("Accept-Language", "zh-Hans_US")
-            .header("Accept", "*/*")
+    fn send(
+        &self,
+        clientid: &str,
+        method: &'static str,
+        url: &str,
+        token: Option<&str>,
+        body: Option<String>,
+    ) -> RawResult<Exchange> {
+        let mut headers = vec![
+            ("User-Agent".into(), USER_AGENT.into()),
+            ("X-Channel".into(), "OPPO".into()),
+            ("X-AppID".into(), APP_ID.into()),
+            ("EX-ClientId".into(), clientid.into()),
+            ("Country-Region".into(), "zh-Hans_US".into()),
+            ("Accept-Language".into(), "zh-Hans_US".into()),
+            ("Accept".into(), "*/*".into()),
+        ];
+        if let Some(tok) = token {
+            headers.push(("Authorization".into(), format!("Bearer {tok}")));
+        }
+        if body.is_some() {
+            headers.push((
+                "Content-Type".into(),
+                "application/json; charset=utf-8".into(),
+            ));
+        }
+        trace::execute(
+            &self.client,
+            trace::Request {
+                method,
+                url: url.to_string(),
+                headers,
+                body,
+            },
+        )
+    }
+
+    /// Check a response that should be `2xx` with no payload, carrying its
+    /// exchange on both paths.
+    fn expect_ok(ex: Exchange, what: &'static str) -> TracedResult<()> {
+        if !(200..300).contains(&ex.status) {
+            return Err(TracedError {
+                error: Error::HttpStatus {
+                    what,
+                    status: ex.status,
+                    body: ex.text,
+                },
+                calls: vec![ex.log],
+            });
+        }
+        Ok(Traced {
+            data: (),
+            calls: vec![ex.log],
+        })
     }
 
     /// Authenticate with `password` already md5-hashed (hex, lowercase).
-    pub fn login(&self, clientid: &str, account: &str, password_md5: &str) -> Result<LoginOutcome> {
+    pub fn login(
+        &self,
+        clientid: &str,
+        account: &str,
+        password_md5: &str,
+    ) -> TracedResult<LoginOutcome> {
         let url = format!("{}/authorization", self.api_base);
         let body = json!({
             "type": ACCOUNT_TYPE,
@@ -85,34 +138,53 @@ impl AuthApi {
             "oaid": "",
             "getui": "",
             "umeng": "",
-        });
-        let resp = self
-            .auth_headers(self.client.post(&url), clientid)
-            .header("Content-Type", "application/json; charset=utf-8")
-            .json(&body)
-            .send()?;
-        let status = resp.status();
-        let text = resp.text()?;
-        if status.as_u16() == 202 {
-            let alert: NewDeviceAlert =
-                serde_json::from_str(&text).map_err(|e| Error::bad_body(text.clone(), e))?;
-            return Ok(LoginOutcome::NewDevice(alert));
-        }
-        if !status.is_success() {
-            return Err(Error::HttpStatus {
-                what: "login",
-                status: status.as_u16(),
-                body: text,
+        })
+        .to_string();
+        let ex = self.send(clientid, "POST", &url, None, Some(body))?;
+        if ex.status == 202 {
+            let alert: NewDeviceAlert = match serde_json::from_str(&ex.text)
+                .map_err(|e| Error::bad_body(ex.text.clone(), e))
+            {
+                Ok(a) => a,
+                Err(error) => {
+                    return Err(TracedError {
+                        error,
+                        calls: vec![ex.log],
+                    });
+                }
+            };
+            return Ok(Traced {
+                data: LoginOutcome::NewDevice(alert),
+                calls: vec![ex.log],
             });
         }
-        let parsed: AuthResponse =
-            serde_json::from_str(&text).map_err(|e| Error::bad_body(text.clone(), e))?;
-        Ok(LoginOutcome::Tokens(parsed))
+        if !(200..300).contains(&ex.status) {
+            return Err(TracedError {
+                error: Error::HttpStatus {
+                    what: "login",
+                    status: ex.status,
+                    body: ex.text,
+                },
+                calls: vec![ex.log],
+            });
+        }
+        match serde_json::from_str::<AuthResponse>(&ex.text)
+            .map_err(|e| Error::bad_body(ex.text, e))
+        {
+            Ok(tokens) => Ok(Traced {
+                data: LoginOutcome::Tokens(tokens),
+                calls: vec![ex.log],
+            }),
+            Err(error) => Err(TracedError {
+                error,
+                calls: vec![ex.log],
+            }),
+        }
     }
 
     /// Request an SMS verification code to register the current client as a
     /// trusted device. `checksum = md5(account + method + t + salt)`.
-    pub fn sendcode(&self, clientid: &str, account: &str) -> Result<()> {
+    pub fn sendcode(&self, clientid: &str, account: &str) -> TracedResult<()> {
         let url = format!("{}/login-terminals/sendcode", self.api_base);
         let t = chrono::Utc::now().timestamp_millis().to_string();
         let checksum = md5_hex(&format!("{account}mobile{t}{CHECKSUM_SALT}"));
@@ -121,13 +193,10 @@ impl AuthApi {
             "method": "mobile",
             "t": t,
             "checksum": checksum,
-        });
-        let resp = self
-            .auth_headers(self.client.post(&url), clientid)
-            .header("Content-Type", "application/json; charset=utf-8")
-            .json(&body)
-            .send()?;
-        check_ok(resp, "sendcode")
+        })
+        .to_string();
+        let ex = self.send(clientid, "POST", &url, None, Some(body))?;
+        Self::expect_ok(ex, "sendcode")
     }
 
     /// Submit the SMS verification code, registering the clientid as trusted.
@@ -137,7 +206,7 @@ impl AuthApi {
         account: &str,
         code: &str,
         terminal_name: &str,
-    ) -> Result<()> {
+    ) -> TracedResult<()> {
         let url = format!("{}/login-terminals/checkcode", self.api_base);
         let body = json!({
             "terminal_name": terminal_name,
@@ -145,13 +214,10 @@ impl AuthApi {
             "method": "mobile",
             "code": code,
             "memo": "",
-        });
-        let resp = self
-            .auth_headers(self.client.put(&url), clientid)
-            .header("Content-Type", "application/json; charset=utf-8")
-            .json(&body)
-            .send()?;
-        check_ok(resp, "checkcode")
+        })
+        .to_string();
+        let ex = self.send(clientid, "PUT", &url, None, Some(body))?;
+        Self::expect_ok(ex, "checkcode")
     }
 
     /// Exchange refresh_token (+ access_token) for fresh tokens.
@@ -160,43 +226,33 @@ impl AuthApi {
         clientid: &str,
         access_token: &str,
         refresh_token: &str,
-    ) -> Result<AuthResponse> {
+    ) -> TracedResult<AuthResponse> {
         let url = format!("{}/authorize/refreshing", self.api_base);
-        let body = json!({ "refresh_token": refresh_token });
-        let resp = self
-            .auth_headers(self.client.post(&url), clientid)
-            .bearer_auth(access_token)
-            .header("Content-Type", "application/json; charset=utf-8")
-            .json(&body)
-            .send()?;
-        parse_token_resp(resp)
+        let body = json!({ "refresh_token": refresh_token }).to_string();
+        let ex = self.send(clientid, "POST", &url, Some(access_token), Some(body))?;
+        if !(200..300).contains(&ex.status) {
+            return Err(TracedError {
+                error: Error::HttpStatus {
+                    what: "refresh",
+                    status: ex.status,
+                    body: ex.text,
+                },
+                calls: vec![ex.log],
+            });
+        }
+        match serde_json::from_str::<AuthResponse>(&ex.text)
+            .map_err(|e| Error::bad_body(ex.text, e))
+        {
+            Ok(tokens) => Ok(Traced {
+                data: tokens,
+                calls: vec![ex.log],
+            }),
+            Err(error) => Err(TracedError {
+                error,
+                calls: vec![ex.log],
+            }),
+        }
     }
-}
-
-fn check_ok(resp: reqwest::blocking::Response, what: &'static str) -> Result<()> {
-    let status = resp.status();
-    let text = resp.text()?;
-    if !status.is_success() {
-        return Err(Error::HttpStatus {
-            what,
-            status: status.as_u16(),
-            body: text,
-        });
-    }
-    Ok(())
-}
-
-fn parse_token_resp(resp: reqwest::blocking::Response) -> Result<AuthResponse> {
-    let status = resp.status();
-    let text = resp.text()?;
-    if !status.is_success() {
-        return Err(Error::HttpStatus {
-            what: "refresh",
-            status: status.as_u16(),
-            body: text,
-        });
-    }
-    serde_json::from_str(&text).map_err(|e| Error::bad_body(text.clone(), e))
 }
 
 /// md5 (lowercase hex) of a string.

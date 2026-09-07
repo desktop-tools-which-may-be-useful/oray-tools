@@ -1,6 +1,6 @@
-use crate::output::{log_auth_header, log_request, log_response};
+use crate::trace::{self, RawResult, RequestLog, Traced, TracedError, TracedResult};
 use crate::{Error, Result};
-use reqwest::blocking::{Client, Response};
+use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -30,6 +30,31 @@ fn plug_url(slapi_base: &str, params: &[(&str, &str)]) -> Result<String> {
     url.query_pairs_mut()
         .extend_pairs(params.iter().map(|(k, v)| (*k, *v)));
     Ok(url.to_string())
+}
+
+/// Percent-encode one `application/x-www-form-urlencoded` component
+/// (space becomes `+`, matching `reqwest`'s `.form()` encoding).
+fn urlencode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.as_bytes() {
+        match *b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Reconstruct the encoded request body `reqwest` would produce for a
+/// `.form()` request, so it can be captured in the request trace.
+fn encode_form(form: &[(&str, &str)]) -> String {
+    form.iter()
+        .map(|(k, v)| format!("{}={}", urlencode(k), urlencode(v)))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 /// Result of a plug state query. `result == 0` means success.
@@ -197,62 +222,77 @@ impl PlugApi {
         }
     }
 
-    fn send_checked(&self, token: &str, method: &str, url: &str) -> Result<(u16, String)> {
-        log_request(method, url);
-        let rb = self
-            .client
-            .request(
-                reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET),
-                url,
-            )
-            .bearer_auth(token)
-            .header("Accept", "application/json")
-            .header("User-Agent", crate::USER_AGENT)
-            .header("X-Channel", "OPPO")
-            .header("Country-Region", "CN");
-        log_auth_header("", token);
-        let resp: Response = rb.send()?;
-        let status = resp.status().as_u16();
-        let text = resp.text()?;
-        log_response(status, &text);
-        if status < 200 || status >= 300 {
-            return Err(Error::HttpStatus {
-                what: "plug request",
-                status,
-                body: text,
-            });
-        }
-        Ok((status, text))
+    fn bearer_headers(&self, token: &str) -> Vec<(String, String)> {
+        vec![
+            ("Authorization".into(), format!("Bearer {token}")),
+            ("Accept".into(), "application/json".into()),
+            ("User-Agent".into(), crate::USER_AGENT.into()),
+            ("X-Channel".into(), "OPPO".into()),
+            ("Country-Region".into(), "CN".into()),
+        ]
     }
 
-    fn post_form_checked(
+    fn ok_2xx(&self, ex: trace::Exchange) -> RawResult<(Vec<RequestLog>, String)> {
+        if !(200..300).contains(&ex.status) {
+            return Err(TracedError {
+                error: Error::HttpStatus {
+                    what: "plug request",
+                    status: ex.status,
+                    body: ex.text,
+                },
+                calls: vec![ex.log],
+            });
+        }
+        Ok((vec![ex.log], ex.text))
+    }
+
+    fn get(&self, token: &str, url: &str) -> RawResult<(Vec<RequestLog>, String)> {
+        let ex = trace::execute(
+            &self.client,
+            trace::Request {
+                method: "GET",
+                url: url.to_string(),
+                headers: self.bearer_headers(token),
+                body: None,
+            },
+        )?;
+        self.ok_2xx(ex)
+    }
+
+    fn post_form(
         &self,
         token: &str,
         url: &str,
         form: &[(&str, &str)],
-    ) -> Result<(u16, String)> {
-        log_request("POST", url);
-        let rb = self
-            .client
-            .post(url)
-            .bearer_auth(token)
-            .header("Accept", "application/json")
-            .header("User-Agent", crate::USER_AGENT)
-            .header("X-Channel", "OPPO")
-            .header("Country-Region", "CN");
-        log_auth_header("", token);
-        let resp = rb.form(form).send()?;
-        let status = resp.status().as_u16();
-        let text = resp.text()?;
-        log_response(status, &text);
-        if status < 200 || status >= 300 {
-            return Err(Error::HttpStatus {
-                what: "plug request",
-                status,
-                body: text,
-            });
+    ) -> RawResult<(Vec<RequestLog>, String)> {
+        let mut headers = self.bearer_headers(token);
+        headers.push((
+            "Content-Type".into(),
+            "application/x-www-form-urlencoded".into(),
+        ));
+        let ex = trace::execute(
+            &self.client,
+            trace::Request {
+                method: "POST",
+                url: url.to_string(),
+                headers,
+                body: Some(encode_form(form)),
+            },
+        )?;
+        self.ok_2xx(ex)
+    }
+
+    /// Run a parse/validation closure against a response body and attach the
+    /// exchanges that produced it to both the success and error paths.
+    fn exchange<T>(
+        calls: Vec<RequestLog>,
+        text: &str,
+        parse: impl FnOnce(&str) -> Result<T>,
+    ) -> TracedResult<T> {
+        match parse(text) {
+            Ok(data) => Ok(Traced { data, calls }),
+            Err(error) => Err(TracedError { error, calls }),
         }
-        Ok((status, text))
     }
 
     fn check_result(what: &'static str, result: i32, message: Option<&str>) -> Result<()> {
@@ -264,7 +304,7 @@ impl PlugApi {
     }
 
     /// Query the current status of one outlet (`index`, default 0 = master).
-    pub fn get_status(&self, token: &str, sn: &str, index: usize) -> Result<PlugStatusResp> {
+    pub fn get_status(&self, token: &str, sn: &str, index: usize) -> TracedResult<PlugStatusResp> {
         let url = plug_url(
             &self.slapi_base,
             &[
@@ -273,14 +313,22 @@ impl PlugApi {
                 ("index", &index.to_string()),
             ],
         )?;
-        let (_, text) = self.send_checked(token, "GET", &url)?;
-        let parsed: PlugStatusResp = parse_json(&text, "get_plug_status")?;
-        Self::check_result("get_plug_status", parsed.result, parsed.message.as_deref())?;
-        Ok(parsed)
+        let (calls, text) = self.get(token, &url)?;
+        Self::exchange(calls, &text, |t| {
+            let parsed: PlugStatusResp = parse_json(t, "get_plug_status")?;
+            Self::check_result("get_plug_status", parsed.result, parsed.message.as_deref())?;
+            Ok(parsed)
+        })
     }
 
     /// Turn an outlet on/off (`on`). `index` 0 = master switch.
-    pub fn set_status(&self, token: &str, sn: &str, index: usize, on: bool) -> Result<SetResp> {
+    pub fn set_status(
+        &self,
+        token: &str,
+        sn: &str,
+        index: usize,
+        on: bool,
+    ) -> TracedResult<SetResp> {
         let st = if on { "1" } else { "0" };
         let url = plug_url(
             &self.slapi_base,
@@ -291,44 +339,52 @@ impl PlugApi {
                 ("_api", "set_plug_status"),
             ],
         )?;
-        let (_, text) = self.send_checked(token, "GET", &url)?;
-        let parsed: SetResp = parse_json(&text, "set_plug_status")?;
-        Self::check_result("set_plug_status", parsed.result, parsed.message.as_deref())?;
-        Ok(parsed)
+        let (calls, text) = self.get(token, &url)?;
+        Self::exchange(calls, &text, |t| {
+            let parsed: SetResp = parse_json(t, "set_plug_status")?;
+            Self::check_result("set_plug_status", parsed.result, parsed.message.as_deref())?;
+            Ok(parsed)
+        })
     }
 
     /// Query the firmware version.
-    pub fn get_version(&self, token: &str, sn: &str) -> Result<PlugVersionResp> {
+    pub fn get_version(&self, token: &str, sn: &str) -> TracedResult<PlugVersionResp> {
         let url = plug_url(
             &self.slapi_base,
             &[("sn", sn), ("_api", "get_plug_version")],
         )?;
-        let (_, text) = self.send_checked(token, "GET", &url)?;
-        let parsed: PlugVersionResp = parse_json(&text, "get_plug_version")?;
-        Self::check_result("get_plug_version", parsed.result, parsed.message.as_deref())?;
-        Ok(parsed)
+        let (calls, text) = self.get(token, &url)?;
+        Self::exchange(calls, &text, |t| {
+            let parsed: PlugVersionResp = parse_json(t, "get_plug_version")?;
+            Self::check_result("get_plug_version", parsed.result, parsed.message.as_deref())?;
+            Ok(parsed)
+        })
     }
 
     /// Query WiFi info.
-    pub fn get_wifi(&self, token: &str, sn: &str) -> Result<PlugWifiResp> {
+    pub fn get_wifi(&self, token: &str, sn: &str) -> TracedResult<PlugWifiResp> {
         let url = plug_url(&self.slapi_base, &[("sn", sn), ("_api", "get_plug_wifi")])?;
-        let (_, text) = self.send_checked(token, "GET", &url)?;
-        let parsed: PlugWifiResp = parse_json(&text, "get_plug_wifi")?;
-        Self::check_result("get_plug_wifi", parsed.result, parsed.message.as_deref())?;
-        Ok(parsed)
+        let (calls, text) = self.get(token, &url)?;
+        Self::exchange(calls, &text, |t| {
+            let parsed: PlugWifiResp = parse_json(t, "get_plug_wifi")?;
+            Self::check_result("get_plug_wifi", parsed.result, parsed.message.as_deref())?;
+            Ok(parsed)
+        })
     }
 
     /// Query the supported feature set.
-    pub fn get_func_list(&self, token: &str, sn: &str) -> Result<FuncListResp> {
+    pub fn get_func_list(&self, token: &str, sn: &str) -> TracedResult<FuncListResp> {
         let url = plug_url(&self.slapi_base, &[("sn", sn), ("_api", "get_func_list")])?;
-        let (_, text) = self.send_checked(token, "GET", &url)?;
-        let parsed: FuncListResp = parse_json(&text, "get_func_list")?;
-        Self::check_result("get_func_list", parsed.result, parsed.message.as_deref())?;
-        Ok(parsed)
+        let (calls, text) = self.get(token, &url)?;
+        Self::exchange(calls, &text, |t| {
+            let parsed: FuncListResp = parse_json(t, "get_func_list")?;
+            Self::check_result("get_func_list", parsed.result, parsed.message.as_deref())?;
+            Ok(parsed)
+        })
     }
 
     /// List the timers configured for one outlet.
-    pub fn timer_list(&self, token: &str, sn: &str, index: usize) -> Result<TimerListResp> {
+    pub fn timer_list(&self, token: &str, sn: &str, index: usize) -> TracedResult<TimerListResp> {
         let url = plug_url(
             &self.slapi_base,
             &[
@@ -337,10 +393,12 @@ impl PlugApi {
                 ("index", &index.to_string()),
             ],
         )?;
-        let (_, text) = self.send_checked(token, "GET", &url)?;
-        let parsed: TimerListResp = parse_json(&text, "plug_timer_get")?;
-        Self::check_result("plug_timer_get", parsed.result, parsed.message.as_deref())?;
-        Ok(parsed)
+        let (calls, text) = self.get(token, &url)?;
+        Self::exchange(calls, &text, |t| {
+            let parsed: TimerListResp = parse_json(t, "plug_timer_get")?;
+            Self::check_result("plug_timer_get", parsed.result, parsed.message.as_deref())?;
+            Ok(parsed)
+        })
     }
 
     /// Add a timer. `time` is a duration (minutes), `action` the resulting
@@ -352,7 +410,7 @@ impl PlugApi {
         sn: &str,
         index: usize,
         timer: &PlugTimer,
-    ) -> Result<SetResp> {
+    ) -> TracedResult<SetResp> {
         let timer_json = serde_json::json!({
             "time": timer.time.unwrap_or(0),
             "action": timer.action.unwrap_or(1),
@@ -369,10 +427,12 @@ impl PlugApi {
                 ("timer", &timer_json),
             ],
         )?;
-        let (_, text) = self.send_checked(token, "GET", &url)?;
-        let parsed: SetResp = parse_json(&text, "plug_timer_add")?;
-        Self::check_result("plug_timer_add", parsed.result, parsed.message.as_deref())?;
-        Ok(parsed)
+        let (calls, text) = self.get(token, &url)?;
+        Self::exchange(calls, &text, |t| {
+            let parsed: SetResp = parse_json(t, "plug_timer_add")?;
+            Self::check_result("plug_timer_add", parsed.result, parsed.message.as_deref())?;
+            Ok(parsed)
+        })
     }
 
     /// Enable or disable a timer, preserving its other settings. `action` is
@@ -388,7 +448,7 @@ impl PlugApi {
         action: u8,
         repeat: u8,
         time: u64,
-    ) -> Result<SetResp> {
+    ) -> TracedResult<SetResp> {
         let url = plug_url(
             &self.slapi_base,
             &[
@@ -402,10 +462,12 @@ impl PlugApi {
                 ("_api", "plug_timer_set"),
             ],
         )?;
-        let (_, text) = self.send_checked(token, "GET", &url)?;
-        let parsed: SetResp = parse_json(&text, "plug_timer_set")?;
-        Self::check_result("plug_timer_set", parsed.result, parsed.message.as_deref())?;
-        Ok(parsed)
+        let (calls, text) = self.get(token, &url)?;
+        Self::exchange(calls, &text, |t| {
+            let parsed: SetResp = parse_json(t, "plug_timer_set")?;
+            Self::check_result("plug_timer_set", parsed.result, parsed.message.as_deref())?;
+            Ok(parsed)
+        })
     }
 
     /// Delete a timer. `repeat`/`time` identify the timer alongside `timer_id`.
@@ -417,7 +479,7 @@ impl PlugApi {
         timer_id: u64,
         repeat: u8,
         time: u64,
-    ) -> Result<SetResp> {
+    ) -> TracedResult<SetResp> {
         let url = plug_url(
             &self.slapi_base,
             &[
@@ -429,14 +491,16 @@ impl PlugApi {
                 ("_api", "plug_timer_del"),
             ],
         )?;
-        let (_, text) = self.send_checked(token, "GET", &url)?;
-        let parsed: SetResp = parse_json(&text, "plug_timer_del")?;
-        Self::check_result("plug_timer_del", parsed.result, parsed.message.as_deref())?;
-        Ok(parsed)
+        let (calls, text) = self.get(token, &url)?;
+        Self::exchange(calls, &text, |t| {
+            let parsed: SetResp = parse_json(t, "plug_timer_del")?;
+            Self::check_result("plug_timer_del", parsed.result, parsed.message.as_deref())?;
+            Ok(parsed)
+        })
     }
 
     /// Query the running countdown for one outlet.
-    pub fn cntdown_get(&self, token: &str, sn: &str, index: usize) -> Result<CntdownResp> {
+    pub fn cntdown_get(&self, token: &str, sn: &str, index: usize) -> TracedResult<CntdownResp> {
         let url = plug_url(
             &self.slapi_base,
             &[
@@ -445,10 +509,12 @@ impl PlugApi {
                 ("index", &index.to_string()),
             ],
         )?;
-        let (_, text) = self.send_checked(token, "GET", &url)?;
-        let parsed: CntdownResp = parse_json(&text, "plug_cntdown_get")?;
-        Self::check_result("plug_cntdown_get", parsed.result, parsed.message.as_deref())?;
-        Ok(parsed)
+        let (calls, text) = self.get(token, &url)?;
+        Self::exchange(calls, &text, |t| {
+            let parsed: CntdownResp = parse_json(t, "plug_cntdown_get")?;
+            Self::check_result("plug_cntdown_get", parsed.result, parsed.message.as_deref())?;
+            Ok(parsed)
+        })
     }
 
     /// Start a countdown that flips the outlet after `count` seconds. `action`
@@ -460,7 +526,7 @@ impl PlugApi {
         index: usize,
         action: u8,
         count: u64,
-    ) -> Result<SetResp> {
+    ) -> TracedResult<SetResp> {
         let url = plug_url(
             &self.slapi_base,
             &[
@@ -471,14 +537,16 @@ impl PlugApi {
                 ("index", &index.to_string()),
             ],
         )?;
-        let (_, text) = self.send_checked(token, "GET", &url)?;
-        let parsed: SetResp = parse_json(&text, "plug_cntdown_add")?;
-        Self::check_result("plug_cntdown_add", parsed.result, parsed.message.as_deref())?;
-        Ok(parsed)
+        let (calls, text) = self.get(token, &url)?;
+        Self::exchange(calls, &text, |t| {
+            let parsed: SetResp = parse_json(t, "plug_cntdown_add")?;
+            Self::check_result("plug_cntdown_add", parsed.result, parsed.message.as_deref())?;
+            Ok(parsed)
+        })
     }
 
     /// Stop any running countdown for one outlet.
-    pub fn cntdown_stop(&self, token: &str, sn: &str, index: usize) -> Result<SetResp> {
+    pub fn cntdown_stop(&self, token: &str, sn: &str, index: usize) -> TracedResult<SetResp> {
         let url = plug_url(
             &self.slapi_base,
             &[
@@ -487,14 +555,16 @@ impl PlugApi {
                 ("index", &index.to_string()),
             ],
         )?;
-        let (_, text) = self.send_checked(token, "GET", &url)?;
-        let parsed: SetResp = parse_json(&text, "plug_cntdown_del")?;
-        Self::check_result("plug_cntdown_del", parsed.result, parsed.message.as_deref())?;
-        Ok(parsed)
+        let (calls, text) = self.get(token, &url)?;
+        Self::exchange(calls, &text, |t| {
+            let parsed: SetResp = parse_json(t, "plug_cntdown_del")?;
+            Self::check_result("plug_cntdown_del", parsed.result, parsed.message.as_deref())?;
+            Ok(parsed)
+        })
     }
 
     /// Turn the LED indicator on/off.
-    pub fn set_led(&self, token: &str, sn: &str, enabled: bool) -> Result<SetResp> {
+    pub fn set_led(&self, token: &str, sn: &str, enabled: bool) -> TracedResult<SetResp> {
         let url = plug_url(
             &self.slapi_base,
             &[
@@ -503,15 +573,17 @@ impl PlugApi {
                 ("enabled", if enabled { "1" } else { "0" }),
             ],
         )?;
-        let (_, text) = self.send_checked(token, "GET", &url)?;
-        let parsed: SetResp = parse_json(&text, "set_plug_led")?;
-        Self::check_result("set_plug_led", parsed.result, parsed.message.as_deref())?;
-        Ok(parsed)
+        let (calls, text) = self.get(token, &url)?;
+        Self::exchange(calls, &text, |t| {
+            let parsed: SetResp = parse_json(t, "set_plug_led")?;
+            Self::check_result("set_plug_led", parsed.result, parsed.message.as_deref())?;
+            Ok(parsed)
+        })
     }
 
     /// Set the outlet state after a power loss (`default`). Meaning of values
     /// follows the plug firmware (e.g. 0 = off, 2 = keep last state).
-    pub fn set_dfltstat(&self, token: &str, sn: &str, default: u32) -> Result<SetResp> {
+    pub fn set_dfltstat(&self, token: &str, sn: &str, default: u32) -> TracedResult<SetResp> {
         let url = plug_url(
             &self.slapi_base,
             &[
@@ -520,35 +592,39 @@ impl PlugApi {
                 ("default", &default.to_string()),
             ],
         )?;
-        let (_, text) = self.send_checked(token, "GET", &url)?;
-        let parsed: SetResp = parse_json(&text, "set_plug_dfltstat")?;
-        Self::check_result(
-            "set_plug_dfltstat",
-            parsed.result,
-            parsed.message.as_deref(),
-        )?;
-        Ok(parsed)
+        let (calls, text) = self.get(token, &url)?;
+        Self::exchange(calls, &text, |t| {
+            let parsed: SetResp = parse_json(t, "set_plug_dfltstat")?;
+            Self::check_result(
+                "set_plug_dfltstat",
+                parsed.result,
+                parsed.message.as_deref(),
+            )?;
+            Ok(parsed)
+        })
     }
 
     /// Fetch a page of status-change logs.
-    pub fn status_logs(&self, token: &str, sn: &str, page: u32) -> Result<StatusLogsData> {
+    pub fn status_logs(&self, token: &str, sn: &str, page: u32) -> TracedResult<StatusLogsData> {
         let url = format!("{}/smart-plug/get-status-logs", self.slapi_base);
-        let (_, text) = self.post_form_checked(
+        let (calls, text) = self.post_form(
             token,
             &url,
             &[("sn", sn), ("page", &page.to_string()), ("_format", "json")],
         )?;
-        let parsed: SlResp<StatusLogsData> = parse_json(&text, "get-status-logs")?;
-        if parsed.code != 0 {
-            return Err(result_err(
-                "get-status-logs",
-                parsed.code.into(),
-                parsed.message.as_deref(),
-            ));
-        }
-        parsed
-            .data
-            .ok_or_else(|| Error::Api("get-status-logs returned no data".into()))
+        Self::exchange(calls, &text, |t| {
+            let parsed: SlResp<StatusLogsData> = parse_json(t, "get-status-logs")?;
+            if parsed.code != 0 {
+                return Err(result_err(
+                    "get-status-logs",
+                    parsed.code.into(),
+                    parsed.message.as_deref(),
+                ));
+            }
+            parsed
+                .data
+                .ok_or_else(|| Error::Api("get-status-logs returned no data".into()))
+        })
     }
 
     /// Rename a plug and/or update its memo (`description`). The endpoint
@@ -561,9 +637,9 @@ impl PlugApi {
         sn: &str,
         name: &str,
         description: &str,
-    ) -> Result<()> {
+    ) -> TracedResult<()> {
         let url = format!("{}/smart-plug/rename", self.slapi_base);
-        let (_, text) = self.post_form_checked(
+        let (calls, text) = self.post_form(
             token,
             &url,
             &[
@@ -573,15 +649,17 @@ impl PlugApi {
                 ("_format", "json"),
             ],
         )?;
-        let parsed: SlResp<serde_json::Value> = parse_json(&text, "rename")?;
-        if parsed.code != 0 {
-            return Err(result_err(
-                "rename",
-                parsed.code.into(),
-                parsed.message.as_deref(),
-            ));
-        }
-        Ok(())
+        Self::exchange(calls, &text, |t| {
+            let parsed: SlResp<serde_json::Value> = parse_json(t, "rename")?;
+            if parsed.code != 0 {
+                return Err(result_err(
+                    "rename",
+                    parsed.code.into(),
+                    parsed.message.as_deref(),
+                ));
+            }
+            Ok(())
+        })
     }
 }
 

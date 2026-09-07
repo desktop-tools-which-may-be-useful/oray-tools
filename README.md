@@ -18,7 +18,10 @@ every device list/info/status is fetched live from the cloud on each command.
 - `remote` — **远程设备** (PCs / phones), from `/remotes`:
   - `list`, `info <id>`, `status <id>`, `rename`, `memo`
 - Machine-readable output: every command accepts `--json`
-- Debug output: every command accepts `--verbose` (raw request/response on stderr)
+- Debug output: every command accepts `--verbose` (full request/response
+  detail on stderr: method, URL, headers, request/response body). Sensitive
+  values are masked by default; add `--trace-raw` to `--verbose` to see them
+  verbatim
 - `--refresh-on-expired` on `wakeup`/`remote` refreshes the token and retries
   once when the server reports `TOKEN_EXPIRED`
 - Machine-local trusted client ID (persisted, no hardcoded value)
@@ -176,9 +179,11 @@ oray-tools remote memo <id> <text>           # set the memo (keeps the name)
 ```
 
 Every command accepts `--json` for machine-readable output and `--verbose`
-to print the raw HTTP request/response on stderr. Add `--refresh-on-expired`
-to any `wakeup`/`remote` command to auto-refresh the access token and retry
-once when the server reports `TOKEN_EXPIRED`.
+to print the full request/response exchange (method, URL, headers, request and
+response bodies) on stderr. Sensitive values are masked by default; add
+`--trace-raw` to see them verbatim. Add `--refresh-on-expired` to any
+`wakeup`/`remote` command to auto-refresh the access token and retry once
+when the server reports `TOKEN_EXPIRED`.
 
 `oray-tools <COMMAND> --help` shows command-specific options.
 
@@ -237,18 +242,22 @@ timezone for a single run and accepts the same formats as the config value
 
 The project is a Cargo workspace with two crates:
 
-- `crates/oray-core` — the protocol layer only, no filesystem/CLI surface.
-  Stateless HTTP clients over the Oray cloud APIs:
+- `crates/oray-core` — the protocol layer only, no filesystem/CLI surface and
+  no output of its own. Stateless HTTP clients over the Oray cloud APIs:
   - `auth` — login/refresh/SMS-verification token flow
   - `wakeup` — `/wakeup/devices` listing (`WakeupApi`)
   - `plug` — smart-plug controls on `slapi.oray.net` (`PlugApi`)
   - `remote` — remote devices on `api-std` (`RemoteApi`)
-  - `output` — verbose request/response logging switch
+  - `trace` — every call returns the parsed data plus the full request/response
+    exchanges as a `Traced<T>` (or `TracedError` on failure); `redacted()`
+    masks sensitive values for display
   Network errors (`oray_core::Error`) and all state are owned by the caller.
 - `crates/oray-cli` — the `oray-tools` binary: clap argument parsing, command
   dispatch, persisted config (`config.rs`), token lifecycle and client-id
-  management (`token.rs`). It injects a shared HTTP client into the core APIs
-  and owns every side effect.
+  management (`token.rs`). It owns every presentation concern — `--json`,
+  human text and the `--verbose`/`--trace-raw` request rendering — by consuming
+  the traces the core returns. It injects a shared HTTP client into the core
+  APIs and owns every side effect.
 
 Dependencies flow one way only: `oray-cli → oray-core`. Build locally with
 `cargo build` (the workspace `default-members` builds only the CLI).

@@ -1,6 +1,6 @@
 pub mod auth;
-pub mod output;
 pub mod remote;
+pub mod trace;
 pub mod wakeup;
 
 /// User-Agent accepted by the api-std endpoints (they reject unknown formats).

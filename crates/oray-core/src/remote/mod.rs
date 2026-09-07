@@ -1,6 +1,6 @@
-use crate::output::{log_auth_header, log_request, log_response};
-use crate::{Error, Result};
-use reqwest::blocking::{Client, RequestBuilder};
+use crate::Error;
+use crate::trace::{self, RawResult, RequestLog, Traced, TracedError, TracedResult};
+use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 
 /// Thin wrapper over the Oray remote-device HTTP endpoints on
@@ -180,72 +180,91 @@ impl RemoteApi {
         }
     }
 
-    fn authed(&self, token: &str, method: &str, url: &str) -> RequestBuilder {
-        log_request(method, url);
-        let rb = self
-            .client
-            .request(
-                reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET),
-                url,
-            )
-            .bearer_auth(token)
-            .header("Accept", "application/json")
-            .header("User-Agent", crate::USER_AGENT)
-            .header("X-Channel", "OPPO")
-            .header("Country-Region", "CN");
-        log_auth_header("", token);
-        rb
+    fn send(
+        &self,
+        token: &str,
+        what: &'static str,
+        method: &'static str,
+        url: &str,
+        body: Option<String>,
+    ) -> RawResult<(Vec<RequestLog>, String)> {
+        let headers = vec![
+            ("Authorization".into(), format!("Bearer {token}")),
+            ("Accept".into(), "application/json".into()),
+            ("User-Agent".into(), crate::USER_AGENT.into()),
+            ("X-Channel".into(), "OPPO".into()),
+            ("Country-Region".into(), "CN".into()),
+        ];
+        let ex = trace::execute(
+            &self.client,
+            trace::Request {
+                method,
+                url: url.to_string(),
+                headers,
+                body,
+            },
+        )?;
+        if !(200..300).contains(&ex.status) {
+            return Err(TracedError {
+                error: Error::HttpStatus {
+                    what,
+                    status: ex.status,
+                    body: ex.text,
+                },
+                calls: vec![ex.log],
+            });
+        }
+        Ok((vec![ex.log], ex.text))
     }
 
     /// List remote devices (same query shape the Oray app uses).
-    pub fn list(&self, token: &str, offset: u64, limit: u64) -> Result<RemotesResponse> {
+    pub fn list(&self, token: &str, offset: u64, limit: u64) -> TracedResult<RemotesResponse> {
         let url = format!(
             "{}/remotes?offset={offset}&limit={limit}&version=v2&new_server=1",
             self.api_base
         );
-        let resp = self.authed(token, "GET", &url).send()?;
-        let status = resp.status();
-        let text = resp.text()?;
-        log_response(status.as_u16(), &text);
-        if !status.is_success() {
-            return Err(Error::HttpStatus {
-                what: "list remotes",
-                status: status.as_u16(),
-                body: text,
-            });
-        }
-        serde_json::from_str(&text).map_err(|e| Error::bad_body(text, e))
+        let (calls, text) = self.send(token, "list remotes", "GET", &url, None)?;
+        trace::finish(
+            calls,
+            serde_json::from_str(&text).map_err(|e| Error::bad_body(text, e)),
+        )
     }
 
     /// Look up a single remote by id from the live list.
-    pub fn find(&self, token: &str, remote_id: u64) -> Result<Remote> {
+    pub fn find(&self, token: &str, remote_id: u64) -> TracedResult<Remote> {
         let all = self.list(token, 0, 10_000)?;
-        all.remotes
+        let calls = all.calls;
+        match all
+            .data
+            .remotes
             .into_iter()
             .find(|r| r.remote_id == remote_id)
-            .ok_or_else(|| Error::Api(format!("remote {remote_id} not found")))
+        {
+            Some(remote) => Ok(Traced {
+                data: remote,
+                calls,
+            }),
+            None => Err(TracedError {
+                error: Error::Api(format!("remote {remote_id} not found")),
+                calls,
+            }),
+        }
     }
 
     /// Fetch extended detail for a remote from the console endpoint.
-    pub fn detail(&self, token: &str, remote_id: u64) -> Result<ConsoleRemote> {
+    pub fn detail(&self, token: &str, remote_id: u64) -> TracedResult<ConsoleRemote> {
         let url = format!(
             "{}/console/remotes/{remote_id}?with_powerplan=true&with_extend=true&new_server=1",
             self.api_base
         );
-        let resp = self.authed(token, "GET", &url).send()?;
-        let status = resp.status();
-        let text = resp.text()?;
-        log_response(status.as_u16(), &text);
-        if !status.is_success() {
-            return Err(Error::HttpStatus {
-                what: "get remote detail",
-                status: status.as_u16(),
-                body: text,
-            });
+        let (calls, text) = self.send(token, "get remote detail", "GET", &url, None)?;
+        match serde_json::from_str::<ConsoleResponse>(&text).map_err(|e| Error::bad_body(text, e)) {
+            Ok(parsed) => Ok(Traced {
+                data: parsed.remote,
+                calls,
+            }),
+            Err(error) => Err(TracedError { error, calls }),
         }
-        let parsed: ConsoleResponse =
-            serde_json::from_str(&text).map_err(|e| Error::bad_body(text.clone(), e))?;
-        Ok(parsed.remote)
     }
 
     /// Update the device name and/or memo (description) of a remote.
@@ -254,21 +273,41 @@ impl RemoteApi {
         token: &str,
         remote_id: u64,
         update: &RemoteUpdate<'_>,
-    ) -> Result<UpdateResponse> {
+    ) -> TracedResult<UpdateResponse> {
         let url = format!("{}/remotes/{remote_id}/info", self.api_base);
-        log_request("PATCH", &url);
-        let resp = self.authed(token, "PATCH", &url).json(update).send()?;
-        let status = resp.status();
-        let text = resp.text()?;
-        log_response(status.as_u16(), &text);
-        if !status.is_success() {
-            return Err(Error::HttpStatus {
-                what: "update remote",
-                status: status.as_u16(),
-                body: text,
+        let body = serde_json::to_string(update)
+            .map_err(|e| Error::Api(format!("serialize update payload: {e}")))?;
+        let headers = vec![
+            ("Authorization".into(), format!("Bearer {token}")),
+            ("Accept".into(), "application/json".into()),
+            ("User-Agent".into(), crate::USER_AGENT.into()),
+            ("X-Channel".into(), "OPPO".into()),
+            ("Country-Region".into(), "CN".into()),
+            ("Content-Type".into(), "application/json".into()),
+        ];
+        let ex = trace::execute(
+            &self.client,
+            trace::Request {
+                method: "PATCH",
+                url,
+                headers,
+                body: Some(body),
+            },
+        )?;
+        if !(200..300).contains(&ex.status) {
+            return Err(TracedError {
+                error: Error::HttpStatus {
+                    what: "update remote",
+                    status: ex.status,
+                    body: ex.text,
+                },
+                calls: vec![ex.log],
             });
         }
-        serde_json::from_str(&text).map_err(|e| Error::bad_body(text, e))
+        trace::finish(
+            vec![ex.log],
+            serde_json::from_str(&ex.text).map_err(|e| Error::bad_body(ex.text, e)),
+        )
     }
 }
 

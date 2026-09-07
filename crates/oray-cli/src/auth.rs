@@ -1,7 +1,7 @@
 //! `auth` command group: authentication management (locally stored).
 
 use crate::config::Config;
-use crate::support::{emit_json, hostname, print_tokens, resolve_clientid};
+use crate::support::{emit_json, hostname, print_tokens, resolve_clientid, traced};
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use oray_core::auth::{AuthApi, LoginOutcome};
@@ -57,7 +57,7 @@ fn do_login(
     let api = AuthApi::new(http.clone(), &server.api_base);
     let terminal_name = hostname();
     let password_md5 = oray_core::auth::md5_hex(password);
-    let resp = match api.login(&cid, account, &password_md5)? {
+    let resp = match traced("login", api.login(&cid, account, &password_md5))? {
         LoginOutcome::Tokens(resp) => resp,
         LoginOutcome::NewDevice(alert) => {
             let target = if !alert.mobile.is_empty() {
@@ -69,8 +69,7 @@ fn do_login(
                 "New device detected ({}), code={}: {target} requires SMS verification. A code has been sent.",
                 alert.error, alert.code
             );
-            api.sendcode(&cid, account)
-                .context("failed to send verification code")?;
+            traced("send verification code", api.sendcode(&cid, account))?;
             eprint!("Enter the SMS code: ");
             use std::io::Write;
             std::io::stdout().flush().ok();
@@ -82,10 +81,12 @@ fn do_login(
             if code.is_empty() {
                 bail!("no code entered");
             }
-            api.checkcode(&cid, account, &code, &terminal_name)
-                .context("failed to verify code")?;
+            traced(
+                "verify code",
+                api.checkcode(&cid, account, &code, &terminal_name),
+            )?;
             eprintln!("Device trusted, logging in again...");
-            match api.login(&cid, account, &password_md5)? {
+            match traced("login", api.login(&cid, account, &password_md5))? {
                 LoginOutcome::Tokens(resp) => resp,
                 other => bail!("re-login did not return tokens: {other:?}"),
             }
@@ -132,7 +133,7 @@ fn do_refresh(
     let cid = resolve_clientid(cfg, clientid);
     let server = cfg.server();
     let api = AuthApi::new(http.clone(), &server.api_base);
-    let resp = api.refresh(&cid, &access, &refresh)?;
+    let resp = traced("refresh", api.refresh(&cid, &access, &refresh))?;
     let expiry = crate::token::refresh_expiry(&resp);
     cfg.token = Some(crate::config::Token {
         access_token: resp.access_token,

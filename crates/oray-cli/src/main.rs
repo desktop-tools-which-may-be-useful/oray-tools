@@ -8,7 +8,6 @@ mod wakeup;
 use anyhow::Result;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use config::Config;
-use oray_core::output;
 use reqwest::blocking::Client as HttpClient;
 use std::path::PathBuf;
 
@@ -38,6 +37,11 @@ struct Cli {
     /// Show raw HTTP requests/responses on stderr
     #[arg(long, global = true)]
     verbose: bool,
+
+    /// With --verbose, show raw (unredacted) request traces; by default
+    /// sensitive values (tokens, passwords, ...) are masked
+    #[arg(long, global = true)]
+    trace_raw: bool,
 
     /// Timezone offset for plug timers, e.g. 480 / +8 / -05:30. Defaults to
     /// config `tz`, else the machine's local offset (with a warning)
@@ -81,7 +85,8 @@ fn main() {
         });
     }
     let cli = Cli::from_arg_matches(&cmd.get_matches()).unwrap_or_else(|e| e.exit());
-    output::set_verbose(cli.verbose);
+    support::set_verbose(cli.verbose);
+    support::set_raw_trace(cli.trace_raw);
     if let Err(e) = run(cli) {
         eprintln!("error: {e:#}");
         std::process::exit(1);
