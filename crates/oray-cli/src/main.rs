@@ -137,15 +137,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_duration_units() {
-        assert_eq!(support::parse_duration("30s"), 30);
-        assert_eq!(support::parse_duration("5m"), 300);
-        assert_eq!(support::parse_duration("2h"), 7200);
-        assert_eq!(support::parse_duration("1d"), 86400);
-        assert_eq!(support::parse_duration("bogus"), 0);
-    }
-
-    #[test]
     fn default_config_has_no_device_storage() {
         let cfg = Config::default();
         assert!(cfg.server.is_none());

@@ -8,13 +8,28 @@
 //! between the two representations given a timezone offset in minutes.
 
 use crate::config::Config;
-use crate::support::{emit_json, parse_duration, parse_on_off, resolve_tz, with_token};
+use crate::support::{emit_json, parse_on_off, resolve_time_bound, resolve_tz, with_token};
 use anyhow::{Result, bail};
 use chrono::Utc;
 use clap::Subcommand;
-use oray_core::wakeup::plug::{PlugApi, PlugTimer};
+use oray_core::wakeup::plug::{PlugApi, PlugTimer, StatusLog, StatusLogsData};
 use reqwest::blocking::Client as HttpClient;
 use std::path::PathBuf;
+
+/// Fetch one page of status-change logs (page 1 is the newest).
+fn fetch_logs_page(
+    http: &HttpClient,
+    cfg: &mut Config,
+    path: &PathBuf,
+    refresh_on_expired: bool,
+    plug: &PlugApi,
+    sn: &str,
+    page: u32,
+) -> Result<StatusLogsData> {
+    with_token(http, cfg, path, refresh_on_expired, |tok| {
+        plug.status_logs(tok, sn, page)
+    })
+}
 
 /// The UTC minutes-of-the-day for a local time in `tz`.
 fn local_to_cloud_time(local_min: u64, tz_min: i64) -> u64 {
@@ -127,11 +142,18 @@ pub enum PlugCmd {
         /// Port index
         #[arg(long, default_value_t = 0)]
         index: usize,
-        /// Only include events newer than this (e.g. 30m, 2h, 1d); also fetches
-        /// all pages up to the newest matching page
+        /// Lower bound: only events at or after this. Either an ago duration
+        /// (30m, 2h, 1d) or an absolute local time (2026-09-01, or
+        /// 2026-09-01 08:30[:00]); a bare date means the start of that day.
         #[arg(long)]
         since: Option<String>,
-        /// Fetch a single specific page instead of all pages
+        /// Upper bound: only events at or before this. Same forms as --since;
+        /// a bare date means the end of that day (23:59:59). Together with
+        /// --since this selects the window between them.
+        #[arg(long)]
+        until: Option<String>,
+        /// Fetch a single specific page instead of reading all pages
+        /// (page 1 is the newest)
         #[arg(long)]
         page: Option<u32>,
     },
@@ -308,36 +330,52 @@ pub fn run(
             sn,
             index: _index,
             since,
+            until,
             page,
         } => {
-            let pages = match page {
-                Some(p) => vec![p],
-                None => {
-                    // read all pages (newest first, page 1)
-                    let first = with_token(http, cfg, path, refresh_on_expired, |tok| {
-                        plug.status_logs(tok, &sn, 1)
-                    })?;
-                    let mut pages = vec![1];
-                    let total = first.totalpage;
-                    if total > 1 {
-                        pages.extend(2..=total);
-                    }
-                    pages
-                }
+            let now = Utc::now().timestamp();
+            let start = match since {
+                Some(ref s) => Some(resolve_time_bound(s, true, now)?),
+                None => None,
             };
-            let cutoff = since.as_deref().map(parse_duration);
-            let mut all = Vec::new();
-            for p in pages {
-                let data = with_token(http, cfg, path, refresh_on_expired, |tok| {
-                    plug.status_logs(tok, &sn, p)
-                })?;
-                for log in data.logs {
-                    let keep = match cutoff {
-                        Some(secs) => log.createtime >= Utc::now().timestamp() - secs,
-                        None => true,
-                    };
-                    if keep {
-                        all.push(log);
+            let end = match until {
+                Some(ref u) => Some(resolve_time_bound(u, false, now)?),
+                None => None,
+            };
+            if let (Some(start), Some(end)) = (start, end)
+                && start > end
+            {
+                bail!(
+                    "invalid window: --since starts after --until ends (since={since:?}, until={until:?})"
+                );
+            }
+            let keep = |log: &StatusLog| {
+                let t = log.createtime;
+                start.is_none_or(|s| t >= s) && end.is_none_or(|e| t <= e)
+            };
+            let mut all: Vec<StatusLog> = Vec::new();
+            match page {
+                Some(p) => {
+                    let data = fetch_logs_page(http, cfg, path, refresh_on_expired, &plug, &sn, p)?;
+                    all.extend(data.logs.into_iter().filter(&keep));
+                }
+                None => {
+                    // Pages are newest-first, so walk them in order and stop
+                    // once a page is fully older than the --since bound.
+                    let mut p: u32 = 1;
+                    loop {
+                        let data =
+                            fetch_logs_page(http, cfg, path, refresh_on_expired, &plug, &sn, p)?;
+                        let totalpage = data.totalpage;
+                        let exhausted = match data.logs.last() {
+                            Some(last) => start.is_some_and(|s| last.createtime < s),
+                            None => true,
+                        };
+                        all.extend(data.logs.into_iter().filter(&keep));
+                        if exhausted || p >= totalpage {
+                            break;
+                        }
+                        p += 1;
                     }
                 }
             }

@@ -173,18 +173,73 @@ pub fn parse_on_off(state: &str) -> Result<bool> {
     }
 }
 
-/// Parse a short duration like `30s`, `5m`, `2h`, `1d` into seconds.
-pub fn parse_duration(s: &str) -> i64 {
+/// Seconds for an "ago" bound like `30s`, `5m`, `2h`, `1d`; `None` when the
+/// string is not a plain duration (e.g. an absolute date/time instead).
+pub fn parse_ago_secs(s: &str) -> Option<i64> {
     let s = s.trim();
-    let (num, unit) = s.split_at(s.len().saturating_sub(1));
-    let n: i64 = num.parse().unwrap_or(0);
-    match unit {
-        "s" => n,
-        "m" => n * 60,
-        "h" => n * 3600,
-        "d" => n * 86400,
-        _ => n,
+    if s.len() < 2 {
+        return None;
     }
+    let (num, unit) = s.split_at(s.len() - 1);
+    if !num.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: i64 = num.parse().ok()?;
+    match unit {
+        "s" => Some(n),
+        "m" => Some(n * 60),
+        "h" => Some(n * 3600),
+        "d" => Some(n * 86400),
+        _ => None,
+    }
+}
+
+/// Resolve a time bound (a `--since`/`--until` value) to a unix timestamp.
+///
+/// Two forms are accepted:
+/// - an "ago" duration (`30m`, `2h`, `1d`) → `now - duration`;
+/// - an absolute local time: `YYYY-MM-DD`, `YYYY-MM-DD HH:MM[:SS]` or the
+///   `T`-separated equivalent. A bare date means the start of the day for a
+///   lower bound (`00:00:00`) or the end of the day for an upper bound
+///   (`23:59:59`), so `--since 2026-09-01 --until 2026-09-02` spans two days.
+pub fn resolve_time_bound(value: &str, lower: bool, now: i64) -> Result<i64> {
+    use chrono::{Local, NaiveDate, NaiveDateTime, TimeZone};
+
+    let v = value.trim();
+    if let Some(secs) = parse_ago_secs(v) {
+        return Ok(now - secs);
+    }
+    let local_epoch = |dt: NaiveDateTime| -> i64 {
+        Local
+            .from_local_datetime(&dt)
+            .earliest()
+            .map(|d| d.timestamp())
+            .unwrap_or_else(|| dt.and_utc().timestamp())
+    };
+    const DATETIME_FORMATS: &[&str] = &[
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+    ];
+    if let Some(dt) = DATETIME_FORMATS
+        .iter()
+        .find_map(|f| NaiveDateTime::parse_from_str(v, f).ok())
+    {
+        return Ok(local_epoch(dt));
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(v, "%Y-%m-%d") {
+        let dt = if lower {
+            date.and_hms_opt(0, 0, 0).expect("valid time")
+        } else {
+            date.and_hms_opt(23, 59, 59).expect("valid time")
+        };
+        return Ok(local_epoch(dt));
+    }
+    bail!(
+        "invalid time bound '{value}': use an ago duration like 30m/2h/1d, or an absolute \
+         local time like 2026-09-01 or 2026-09-01 08:30[:00]"
+    )
 }
 
 /// Parse a user-supplied timezone value into minutes east of UTC.
@@ -314,5 +369,53 @@ mod tests {
         let mut cfg = Config::default();
         cfg.tz = Some("bogus".to_string());
         assert!(resolve_tz(&cfg, None).is_err());
+    }
+
+    #[test]
+    fn ago_bounds() {
+        assert_eq!(parse_ago_secs("30s"), Some(30));
+        assert_eq!(parse_ago_secs("5m"), Some(300));
+        assert_eq!(parse_ago_secs("2h"), Some(7200));
+        assert_eq!(parse_ago_secs("1d"), Some(86400));
+        assert_eq!(parse_ago_secs("bogus"), None);
+        assert_eq!(parse_ago_secs("1x"), None);
+        assert_eq!(parse_ago_secs("2026-09-01"), None);
+        assert_eq!(parse_ago_secs("0"), None);
+    }
+
+    #[test]
+    fn ago_resolution_is_relative_to_now() {
+        let now = 1_800_000_000;
+        assert_eq!(resolve_time_bound("2h", true, now).unwrap(), now - 7200);
+        assert_eq!(resolve_time_bound("1d", false, now).unwrap(), now - 86400);
+    }
+
+    #[test]
+    fn absolute_time_equivalence() {
+        let now = 1_800_000_000;
+        let with_secs = resolve_time_bound("2026-09-01 08:30:00", true, now).unwrap();
+        let no_secs = resolve_time_bound("2026-09-01 08:30", true, now).unwrap();
+        let t_form = resolve_time_bound("2026-09-01T08:30:00", true, now).unwrap();
+        assert_eq!(with_secs, no_secs);
+        assert_eq!(with_secs, t_form);
+    }
+
+    #[test]
+    fn date_only_expands_to_full_day() {
+        let now = 1_800_000_000;
+        let start = resolve_time_bound("2026-09-01", true, now).unwrap();
+        let midnight = resolve_time_bound("2026-09-01 00:00:00", true, now).unwrap();
+        assert_eq!(start, midnight);
+        let end = resolve_time_bound("2026-09-01", false, now).unwrap();
+        let end_of_day = resolve_time_bound("2026-09-01 23:59:59", false, now).unwrap();
+        assert_eq!(end, end_of_day);
+    }
+
+    #[test]
+    fn invalid_time_bound_is_an_error() {
+        let now = 1_800_000_000;
+        assert!(resolve_time_bound("not-a-time", true, now).is_err());
+        assert!(resolve_time_bound("2026-13-01", true, now).is_err());
+        assert!(resolve_time_bound("", true, now).is_err());
     }
 }
