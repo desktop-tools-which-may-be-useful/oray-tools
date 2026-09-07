@@ -31,6 +31,40 @@ fn fetch_logs_page(
     })
 }
 
+/// Return page `p`, (re)using a cache indexed by page number.
+#[allow(clippy::too_many_arguments)]
+fn load_logs_page<'a>(
+    http: &HttpClient,
+    cfg: &mut Config,
+    path: &PathBuf,
+    refresh_on_expired: bool,
+    plug: &PlugApi,
+    sn: &str,
+    page: u32,
+    cached: &'a mut [Option<StatusLogsData>],
+) -> Result<&'a StatusLogsData> {
+    let i = page as usize;
+    if cached[i].is_none() {
+        cached[i] = Some(fetch_logs_page(
+            http,
+            cfg,
+            path,
+            refresh_on_expired,
+            plug,
+            sn,
+            page,
+        )?);
+    }
+    Ok(cached[i].as_ref().expect("loaded page"))
+}
+
+/// The `(newest, oldest)` event timestamp pair seen on a page.
+fn logs_page_span(data: &StatusLogsData) -> Option<(i64, i64)> {
+    let newest = data.logs.first()?.createtime;
+    let oldest = data.logs.last()?.createtime;
+    Some((newest, oldest))
+}
+
 /// The UTC minutes-of-the-day for a local time in `tz`.
 fn local_to_cloud_time(local_min: u64, tz_min: i64) -> u64 {
     ((local_min as i64 - tz_min).rem_euclid(1440)) as u64
@@ -152,7 +186,7 @@ pub enum PlugCmd {
         /// --since this selects the window between them.
         #[arg(long)]
         until: Option<String>,
-        /// Fetch a single specific page instead of reading all pages
+        /// Fetch a single specific page instead of locating the window
         /// (page 1 is the newest)
         #[arg(long)]
         page: Option<u32>,
@@ -360,22 +394,101 @@ pub fn run(
                     all.extend(data.logs.into_iter().filter(&keep));
                 }
                 None => {
-                    // Pages are newest-first, so walk them in order and stop
-                    // once a page is fully older than the --since bound.
-                    let mut p: u32 = 1;
-                    loop {
-                        let data =
-                            fetch_logs_page(http, cfg, path, refresh_on_expired, &plug, &sn, p)?;
-                        let totalpage = data.totalpage;
-                        let exhausted = match data.logs.last() {
-                            Some(last) => start.is_some_and(|s| last.createtime < s),
-                            None => true,
-                        };
-                        all.extend(data.logs.into_iter().filter(&keep));
-                        if exhausted || p >= totalpage {
-                            break;
+                    // Pages are newest-first. Page 1 reports the total, then we
+                    // binary-search the first/last page that can intersect the
+                    // window (probing ~log2(pages)) and read only that slice,
+                    // instead of walking from page 1.
+                    let first =
+                        fetch_logs_page(http, cfg, path, refresh_on_expired, &plug, &sn, 1)?;
+                    let total = first.totalpage.max(1);
+                    let mut cached: Vec<Option<StatusLogsData>> =
+                        (0..=total).map(|_| None).collect();
+                    cached[1] = Some(first);
+
+                    // p_low: first page whose oldest event is at or before the
+                    // upper bound (nothing on earlier pages can match).
+                    let p_low = match end {
+                        None => Some(1),
+                        Some(e) => {
+                            let (mut lo, mut hi) = (1u32, total);
+                            let mut found = None;
+                            while lo <= hi {
+                                let mid = lo + (hi - lo) / 2;
+                                let data = load_logs_page(
+                                    http,
+                                    cfg,
+                                    path,
+                                    refresh_on_expired,
+                                    &plug,
+                                    &sn,
+                                    mid,
+                                    &mut cached,
+                                )?;
+                                let ok =
+                                    logs_page_span(data).is_some_and(|(_, oldest)| oldest <= e);
+                                if ok {
+                                    found = Some(mid);
+                                    hi = mid.saturating_sub(1);
+                                } else {
+                                    lo = mid + 1;
+                                }
+                            }
+                            found
                         }
-                        p += 1;
+                    };
+
+                    // p_high: last page whose newest event is at or after the
+                    // lower bound (nothing on later pages can match).
+                    let p_high = match start {
+                        None => Some(total),
+                        Some(s) => {
+                            let (mut lo, mut hi) = (1u32, total);
+                            let mut found = None;
+                            while lo <= hi {
+                                let mid = lo + (hi - lo) / 2;
+                                let data = load_logs_page(
+                                    http,
+                                    cfg,
+                                    path,
+                                    refresh_on_expired,
+                                    &plug,
+                                    &sn,
+                                    mid,
+                                    &mut cached,
+                                )?;
+                                let ok =
+                                    logs_page_span(data).is_some_and(|(newest, _)| newest >= s);
+                                if ok {
+                                    found = Some(mid);
+                                    lo = mid + 1;
+                                } else {
+                                    hi = mid.saturating_sub(1);
+                                }
+                            }
+                            found
+                        }
+                    };
+
+                    if let (Some(lo), Some(hi)) = (p_low, p_high)
+                        && lo <= hi
+                    {
+                        for p in lo..=hi {
+                            let i = p as usize;
+                            if cached[i].is_none() {
+                                cached[i] = Some(fetch_logs_page(
+                                    http,
+                                    cfg,
+                                    path,
+                                    refresh_on_expired,
+                                    &plug,
+                                    &sn,
+                                    p,
+                                )?);
+                            }
+                            if let Some(data) = cached[i].take() {
+                                all.extend(data.logs.into_iter().filter(|l| keep(l)));
+                            }
+                        }
                     }
                 }
             }

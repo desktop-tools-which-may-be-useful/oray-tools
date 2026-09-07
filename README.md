@@ -158,9 +158,8 @@ oray-tools wakeup plug off <sn> [--index N]               # switch off
 oray-tools wakeup plug logs <sn> [--since 2h] [--until 6h] [--page N] # status history
 # --since/--until bound the window (ago like 2h/1d, or absolute local time
 # like 2026-09-03 or 2026-09-03 09:00[:00]); a bare date runs to the day's
-# end for --until. The server has no time-window query, so the CLI walks
-# pages newest-first, stops once older than the --since bound, and filters
-# locally.
+# end for --until. The server has no time-window query, so the CLI locates
+# the pages that can match (binary search) and filters locally.
 oray-tools wakeup plug timer list <sn>                    # list timers
 oray-tools wakeup plug timer add <sn> --time 480 --action 1 --repeat 31  # LOCAL 08:00, Mon-Fri (bit0=Mon..bit6=Sun, 0=once); plug stores UTC, tool converts
 oray-tools wakeup plug timer remove <sn> <timer-id>
