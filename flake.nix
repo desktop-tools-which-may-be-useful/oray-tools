@@ -20,7 +20,7 @@
         {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "oray-tools";
-            version = "1.0.0";
+            version = "1.0.1";
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
             meta = with pkgs.lib; {
