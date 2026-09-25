@@ -395,13 +395,10 @@ fn do_refresh(
     let server = cfg.server();
     let api = AuthApi::new(http.clone(), &server.api_base);
     let resp = traced("refresh", api.refresh(&cid, &access, &refresh))?;
-    let expiry = crate::token::refresh_expiry(&resp);
-    cfg.token = Some(crate::config::Token {
-        access_token: resp.access_token,
-        refresh_token: resp.refresh_token,
-        refresh_expires: expiry,
-    });
-    cfg.save(path)?;
+    // Validate and save in one place (`token::persist_refreshed`): a
+    // placeholder body must fail here instead of overwriting the credentials
+    // this command is supposed to renew.
+    crate::token::persist_refreshed(cfg, path, &resp)?;
     if json {
         emit_json(
             true,

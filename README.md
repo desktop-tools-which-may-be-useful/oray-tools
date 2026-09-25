@@ -315,6 +315,16 @@ when the server reports `TOKEN_EXPIRED` or answers with a bare HTTP 401;
 the detection is exact, so an unrelated business error containing `1010`
 (`sn=1010… not found`) does not cause a pointless refresh.
 
+A refresh response is validated before anything is written: `auth refresh` and
+every automatic refresh accept only an `access_token` that is a three-segment
+JWT carrying a numeric `exp` plus a `refresh_token` of at least 16 characters.
+The refresh endpoint sometimes answers `HTTP 200` with placeholder tokens
+(`access_token = "a"`, `refresh_token = "r"`) instead of failing; that response
+is now rejected with exit 1 — reporting field lengths only, never token values —
+and the stored config is left untouched, instead of being saved and turning
+every later command into a `401 … token contains an invalid number of segments`.
+If it keeps happening, log in again with `oray-tools auth login`.
+
 `oray-tools <COMMAND> --help` shows command-specific options.
 
 Example:

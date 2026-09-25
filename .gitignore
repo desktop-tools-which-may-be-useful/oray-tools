@@ -12,3 +12,7 @@
 # committed.
 /*.toml
 !/Cargo.toml
+
+# Generated test report: contains the local account name, device ids and
+# token expiry timestamps of whoever runs scripts/cli_test_report.sh.
+/TEST_REPORT.md

@@ -91,11 +91,59 @@ pub fn ensure_token(
         "refresh access token",
         api.refresh(&cid, &current.access_token, &current.refresh_token),
     )?;
-    let expiry = refresh_expiry(&refreshed);
+    persist_refreshed(cfg, path, &refreshed)
+}
+
+/// Shortest `refresh_token` worth saving. Real ones are ~76 characters; the
+/// placeholder the refresh endpoint hands back is a single `r`.
+pub const MIN_REFRESH_TOKEN_LEN: usize = 16;
+
+/// Validate a **refresh** response before it may replace the saved tokens.
+///
+/// `POST /authorize/refreshing` answers `HTTP 200` with a placeholder body —
+/// `{"access_token":"a","refresh_token":"r","refresh_ttl":2592000}` — whenever
+/// it does not accept the refresh token (typically one that has already been
+/// consumed). That body parses cleanly into [`AuthResponse`]: every field is
+/// present and `refresh_ttl` even carries a plausible 30-day value, so without
+/// this guard the one-character tokens are written to the config, every later
+/// command dies with `401 ... token contains an invalid number of segments`,
+/// and only a fresh `auth login` recovers.
+///
+/// Accepted: an `access_token` that is a three-segment JWT whose payload
+/// carries a numeric `exp` (the exact predicate [`access_expiry`] uses) plus a
+/// `refresh_token` of at least [`MIN_REFRESH_TOKEN_LEN`] characters. Anything
+/// else is rejected **before** `Config::save`, so the credentials already on
+/// disk stay usable.
+///
+/// The error names only field *lengths*: the other field may still hold a
+/// real token at that point, and that must not leak into logs.
+pub fn validate_refresh_response(resp: &AuthResponse) -> Result<()> {
+    let access_ok =
+        resp.access_token.matches('.').count() == 2 && access_expiry(&resp.access_token).is_some();
+    let refresh_ok = resp.refresh_token.len() >= MIN_REFRESH_TOKEN_LEN;
+    if access_ok && refresh_ok {
+        return Ok(());
+    }
+    bail!(
+        "refresh returned an unusable token payload (access_token {} chars, refresh_token {} chars; \
+         expected a three-segment JWT with an `exp` claim and a refresh token of at least \
+         {MIN_REFRESH_TOKEN_LEN} chars) — the saved config was left untouched; if this keeps \
+         happening, run `oray-tools auth login`",
+        resp.access_token.len(),
+        resp.refresh_token.len()
+    );
+}
+
+/// Validate `resp` and persist it as the saved token, returning what was
+/// stored. Every refresh response reaches the disk **only** through here —
+/// `auth refresh` and the automatic refresh inside [`ensure_token`] alike — so
+/// a placeholder body can never replace working credentials.
+pub fn persist_refreshed(cfg: &mut Config, path: &PathBuf, resp: &AuthResponse) -> Result<Token> {
+    validate_refresh_response(resp)?;
     let token = Token {
-        access_token: refreshed.access_token,
-        refresh_token: refreshed.refresh_token,
-        refresh_expires: expiry,
+        access_token: resp.access_token.clone(),
+        refresh_token: resp.refresh_token.clone(),
+        refresh_expires: refresh_expiry(resp),
     };
     cfg.token = Some(token.clone());
     cfg.save(path)?;
@@ -226,5 +274,127 @@ mod tests {
         // too and failed the same way).
         assert_eq!(access_expiry(&jwt(r#"{"isa":500,"iat":500}"#)), None);
         assert!(is_access_expired(&jwt(r#"{"isa":500,"iat":500}"#)));
+    }
+
+    /// A refresh response whose tokens are JWT-shaped and long enough.
+    fn good_refresh_response() -> AuthResponse {
+        resp(&format!(
+            r#"{{"access_token":"{}","refresh_token":"{}","refresh_ttl":2592000}}"#,
+            jwt(&format!(
+                r#"{{"exp":{}}}"#,
+                chrono::Utc::now().timestamp() + TEN_YEARS
+            )),
+            "r".repeat(76)
+        ))
+    }
+
+    /// The placeholder `POST /authorize/refreshing` hands back when it refuses
+    /// the refresh token: one-character values that still parse into a valid
+    /// `AuthResponse`, which is exactly why validation has to happen here.
+    #[test]
+    fn placeholder_refresh_response_is_rejected() {
+        let r = resp(r#"{"access_token":"a","refresh_token":"r","refresh_ttl":2592000}"#);
+        let err = validate_refresh_response(&r).unwrap_err().to_string();
+        assert!(err.contains("access_token 1 chars"), "{err}");
+        assert!(err.contains("refresh_token 1 chars"), "{err}");
+        assert!(err.contains("left untouched"), "{err}");
+        // Field lengths only — never the token values themselves.
+        assert!(!err.contains("\"a\"") && !err.contains("\"r\""), "{err}");
+        assert!(validate_refresh_response(&good_refresh_response()).is_ok());
+    }
+
+    /// A refresh token shorter than the real thing is refused even when the
+    /// access token looks fine.
+    #[test]
+    fn short_refresh_token_is_rejected() {
+        let r = resp(&format!(
+            r#"{{"access_token":"{}","refresh_token":"short"}}"#,
+            jwt(r#"{"exp":9999999999}"#)
+        ));
+        let err = validate_refresh_response(&r).unwrap_err().to_string();
+        assert!(err.contains("refresh_token 5 chars"), "{err}");
+    }
+
+    /// The access token must be a *three-segment* JWT — a single segment or a
+    /// token with extra dots is refused even if its middle part decodes.
+    #[test]
+    fn access_token_must_be_a_three_segment_jwt() {
+        let single = resp(&format!(
+            r#"{{"access_token":"{}","refresh_token":"{}"}}"#,
+            "x".repeat(76),
+            "r".repeat(76)
+        ));
+        assert!(validate_refresh_response(&single).is_err());
+
+        let four_segments = resp(&format!(
+            r#"{{"access_token":"{}.extra","refresh_token":"{}"}}"#,
+            jwt(r#"{"exp":9999999999}"#),
+            "r".repeat(76)
+        ));
+        assert!(validate_refresh_response(&four_segments).is_err());
+    }
+
+    /// A payload without a usable numeric `exp` is refused: `access_expiry`
+    /// would report `None`, the token would count as expired forever and every
+    /// later refresh would loop.
+    #[test]
+    fn access_token_without_exp_claim_is_rejected() {
+        let r = resp(&format!(
+            r#"{{"access_token":"{}","refresh_token":"{}"}}"#,
+            jwt(r#"{"isa":500,"iat":500}"#),
+            "r".repeat(76)
+        ));
+        assert!(validate_refresh_response(&r).is_err());
+        let string_exp = resp(&format!(
+            r#"{{"access_token":"{}","refresh_token":"{}"}}"#,
+            jwt(r#"{"exp":"9999999999"}"#),
+            "r".repeat(76)
+        ));
+        assert!(validate_refresh_response(&string_exp).is_err());
+    }
+
+    /// The defect this whole guard exists for: a rejected response must leave
+    /// the credentials on disk exactly as they were, while an accepted one
+    /// still persists normally.
+    #[test]
+    fn persist_refreshed_refuses_to_overwrite_the_saved_config() {
+        let dir =
+            std::env::temp_dir().join(format!("oray-tools-token-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let _ = std::fs::remove_file(&path);
+
+        let saved_access = jwt(&format!(
+            r#"{{"exp":{}}}"#,
+            chrono::Utc::now().timestamp() + 3600
+        ));
+        let mut cfg = Config {
+            token: Some(Token {
+                access_token: saved_access.clone(),
+                refresh_token: "r".repeat(76),
+                refresh_expires: 123,
+            }),
+            ..Config::default()
+        };
+        cfg.save(&path).unwrap();
+
+        // Placeholder response → rejected, nothing written.
+        let placeholder = resp(r#"{"access_token":"a","refresh_token":"r","refresh_ttl":2592000}"#);
+        assert!(persist_refreshed(&mut cfg, &path, &placeholder).is_err());
+        let (reloaded, _) = Config::load_explicit(&path).unwrap();
+        assert_eq!(
+            reloaded.token.as_ref().unwrap().access_token,
+            saved_access,
+            "the placeholder must never reach the config"
+        );
+
+        // Well-formed response → validated and saved.
+        let good = good_refresh_response();
+        let expected = good.access_token.clone();
+        assert!(persist_refreshed(&mut cfg, &path, &good).is_ok());
+        let (reloaded, _) = Config::load_explicit(&path).unwrap();
+        assert_eq!(reloaded.token.as_ref().unwrap().access_token, expected);
+
+        let _ = std::fs::remove_file(&path);
     }
 }
