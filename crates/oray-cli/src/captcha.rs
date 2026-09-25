@@ -8,7 +8,9 @@
 //! caller.
 //!
 //! The page itself lives in `captcha_page.html`; it posts the token to
-//! `POST /token` on the same loopback origin.
+//! `POST /token` on the same loopback origin. Because a plain POST skips CORS
+//! preflight, the server only accepts that POST from its own origin — a
+//! request without an `Origin` header (curl, unit tests) is still accepted.
 
 use anyhow::{Context, Result, bail};
 use std::io::{Read, Write};
@@ -32,11 +34,22 @@ pub struct Request {
     pub method: String,
     pub path: String,
     pub body: Vec<u8>,
+    /// Value of the `Origin` header, when the client sent one.
+    pub origin: Option<String>,
 }
 
 /// Resolve a request to `(status, content type, body)`. `POST /token` also
 /// forwards the captcha token to `token`.
-fn route(req: &Request, mobile: &str, token: &mpsc::Sender<String>) -> (u16, &'static str, String) {
+///
+/// `origin` is the origin this server itself is reachable under
+/// (`http://127.0.0.1:<port>`); a `POST /token` coming from anywhere else is
+/// refused with 403 before it can reach `token`.
+fn route(
+    req: &Request,
+    mobile: &str,
+    token: &mpsc::Sender<String>,
+    origin: &str,
+) -> (u16, &'static str, String) {
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/") | ("GET", "/index.html") => (
             200,
@@ -44,6 +57,22 @@ fn route(req: &Request, mobile: &str, token: &mpsc::Sender<String>) -> (u16, &'s
             PAGE.replace("{{MOBILE}}", &escape(mobile)),
         ),
         ("POST", "/token") => {
+            // A plain POST is simple enough to skip CORS preflight, so any
+            // local process — or a hostile page in the user's browser — could
+            // otherwise post to this port. Only accept the loopback page's
+            // own origin: no header at all (curl, unit tests) stays usable,
+            // everything else is refused without touching the channel.
+            match req.origin.as_deref() {
+                None => (),
+                Some(actual) if actual == origin => (),
+                Some(_) => {
+                    return (
+                        403,
+                        "text/plain; charset=utf-8",
+                        "forbidden origin".to_string(),
+                    );
+                }
+            }
             let value: serde_json::Value =
                 serde_json::from_slice(&req.body).unwrap_or(serde_json::Value::Null);
             let captcha = value
@@ -88,7 +117,8 @@ fn escape(s: &str) -> String {
 }
 
 /// Read one HTTP request from `stream`, returning `None` when the peer hangs
-/// up without sending a complete request head.
+/// up without sending a complete request head. Besides the request line and
+/// body the `Origin` header is captured (empty/absent means no origin).
 fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
     let mut buf = Vec::new();
     let head_end = loop {
@@ -126,11 +156,18 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
     let method = parts.next().unwrap_or_default().to_string();
     let path = parts.next().unwrap_or_default().to_string();
     let mut content_length = 0usize;
+    let mut origin: Option<String> = None;
     for line in lines {
-        if let Some((name, value)) = line.split_once(':')
-            && name.eq_ignore_ascii_case("content-length")
-        {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("content-length") {
             content_length = value.trim().parse().unwrap_or(0).min(MAX_BODY);
+        } else if name.eq_ignore_ascii_case("origin") {
+            let value = value.trim();
+            if !value.is_empty() {
+                origin = Some(value.to_string());
+            }
         }
     }
 
@@ -152,7 +189,12 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
         }
     }
     body.truncate(content_length);
-    Ok(Some(Request { method, path, body }))
+    Ok(Some(Request {
+        method,
+        path,
+        body,
+        origin,
+    }))
 }
 
 /// Offset just past the `\r\n\r\n` terminator, if present.
@@ -164,6 +206,7 @@ fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) 
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         410 => "Gone",
         _ => "Error",
@@ -177,17 +220,20 @@ fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) 
     let _ = stream.flush();
 }
 
-fn serve(listener: TcpListener, mobile: String, token: mpsc::Sender<String>) {
+/// Serve requests until the listener is dropped. `origin` is the only origin
+/// allowed to POST a token (see [`route`]).
+fn serve(listener: TcpListener, mobile: String, token: mpsc::Sender<String>, origin: String) {
     for incoming in listener.incoming() {
         let Ok(mut stream) = incoming else { continue };
         let mobile = mobile.clone();
         let token = token.clone();
+        let origin = origin.clone();
         std::thread::spawn(move || {
             let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
             let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
             match read_request(&mut stream) {
                 Ok(Some(req)) => {
-                    let (status, content_type, body) = route(&req, &mobile, &token);
+                    let (status, content_type, body) = route(&req, &mobile, &token, &origin);
                     respond(&mut stream, status, content_type, &body);
                 }
                 Ok(None) => respond(&mut stream, 400, "text/plain; charset=utf-8", "bad request"),
@@ -236,10 +282,11 @@ pub fn open_browser(url: &str) -> bool {
 pub fn obtain_token(mobile: &str, open: bool, timeout: Duration) -> Result<String> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).context("bind loopback captcha server")?;
     let port = listener.local_addr().context("local address")?.port();
-    let url = format!("http://127.0.0.1:{port}/");
+    let origin = format!("http://127.0.0.1:{port}");
+    let url = format!("{origin}/");
     let (tx, rx) = mpsc::channel::<String>();
     let mobile = mobile.to_string();
-    std::thread::spawn(move || serve(listener, mobile, tx));
+    std::thread::spawn(move || serve(listener, mobile, tx, origin));
 
     eprintln!("Solve the security check in your browser: {url}");
     if open && open_browser(&url) {
@@ -267,18 +314,30 @@ pub fn obtain_token(mobile: &str, open: bool, timeout: Duration) -> Result<Strin
 mod tests {
     use super::*;
 
+    /// Origin the loopback page is served from in these tests.
+    const LOCAL_ORIGIN: &str = "http://127.0.0.1:42424";
+
     fn request(method: &str, path: &str, body: &[u8]) -> Request {
         Request {
             method: method.to_string(),
             path: path.to_string(),
             body: body.to_vec(),
+            origin: None,
+        }
+    }
+
+    fn request_with_origin(method: &str, path: &str, body: &[u8], origin: &str) -> Request {
+        Request {
+            origin: Some(origin.to_string()),
+            ..request(method, path, body)
         }
     }
 
     #[test]
     fn page_carries_the_client_scene() {
         let (tx, rx) = mpsc::channel();
-        let (status, content_type, body) = route(&request("GET", "/", b""), "123****8901", &tx);
+        let (status, content_type, body) =
+            route(&request("GET", "/", b""), "123****8901", &tx, LOCAL_ORIGIN);
         assert_eq!(status, 200);
         assert!(content_type.starts_with("text/html"));
         assert!(body.contains("1sdsal45"), "Aliyun scene id missing");
@@ -292,7 +351,12 @@ mod tests {
     fn token_post_is_forwarded() {
         let (tx, rx) = mpsc::channel();
         let body = br#"{"captchaVerifyParam":"TOKEN123","raw":"x"}"#;
-        let (status, _, _) = route(&request("POST", "/token", body), "123****8901", &tx);
+        let (status, _, _) = route(
+            &request("POST", "/token", body),
+            "123****8901",
+            &tx,
+            LOCAL_ORIGIN,
+        );
         assert_eq!(status, 200);
         assert_eq!(rx.try_recv().unwrap(), "TOKEN123");
     }
@@ -301,7 +365,12 @@ mod tests {
     fn token_post_without_param_falls_back_to_raw() {
         let (tx, rx) = mpsc::channel();
         let body = br#"{"raw":"RAWTOKEN"}"#;
-        let (status, _, _) = route(&request("POST", "/token", body), "123****8901", &tx);
+        let (status, _, _) = route(
+            &request("POST", "/token", body),
+            "123****8901",
+            &tx,
+            LOCAL_ORIGIN,
+        );
         assert_eq!(status, 200);
         assert_eq!(rx.try_recv().unwrap(), "RAWTOKEN");
     }
@@ -309,7 +378,12 @@ mod tests {
     #[test]
     fn empty_token_is_rejected() {
         let (tx, rx) = mpsc::channel();
-        let (status, _, _) = route(&request("POST", "/token", b"{}"), "123****8901", &tx);
+        let (status, _, _) = route(
+            &request("POST", "/token", b"{}"),
+            "123****8901",
+            &tx,
+            LOCAL_ORIGIN,
+        );
         assert_eq!(status, 400);
         assert!(rx.try_recv().is_err());
     }
@@ -317,8 +391,43 @@ mod tests {
     #[test]
     fn unknown_paths_404() {
         let (tx, _) = mpsc::channel();
-        let (status, _, _) = route(&request("GET", "/favicon.ico", b""), "x", &tx);
+        let (status, _, _) = route(&request("GET", "/favicon.ico", b""), "x", &tx, LOCAL_ORIGIN);
         assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn token_post_from_another_origin_is_forbidden() {
+        let (tx, rx) = mpsc::channel();
+        let body = br#"{"captchaVerifyParam":"HIJACKED"}"#;
+        let req = request_with_origin("POST", "/token", body, "http://evil.example");
+        let (status, _, text) = route(&req, "123****8901", &tx, LOCAL_ORIGIN);
+        assert_eq!(status, 403);
+        assert_eq!(text, "forbidden origin");
+        assert!(
+            rx.try_recv().is_err(),
+            "a cross-origin post must not deliver a token"
+        );
+    }
+
+    #[test]
+    fn token_post_from_the_local_origin_is_allowed() {
+        let (tx, rx) = mpsc::channel();
+        let body = br#"{"captchaVerifyParam":"TOKEN123"}"#;
+        let req = request_with_origin("POST", "/token", body, LOCAL_ORIGIN);
+        let (status, _, _) = route(&req, "123****8901", &tx, LOCAL_ORIGIN);
+        assert_eq!(status, 200);
+        assert_eq!(rx.try_recv().unwrap(), "TOKEN123");
+    }
+
+    #[test]
+    fn page_get_is_not_origin_checked() {
+        // The page itself is loaded without an Origin header and must stay
+        // reachable regardless — only POST /token is origin-gated.
+        let (tx, rx) = mpsc::channel();
+        let req = request_with_origin("GET", "/", b"", "http://evil.example");
+        let (status, _, _) = route(&req, "123****8901", &tx, LOCAL_ORIGIN);
+        assert_eq!(status, 200);
+        assert!(rx.try_recv().is_err(), "GET must not produce a token");
     }
 
     #[test]
@@ -337,6 +446,102 @@ mod tests {
         assert_eq!(req.method, "POST");
         assert_eq!(req.path, "/token");
         assert_eq!(req.body, b"{\"a\":1}");
+        assert_eq!(req.origin, None, "no Origin header means no origin");
+    }
+
+    #[test]
+    fn decodes_the_origin_header() {
+        let raw = concat!(
+            "POST /token HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Origin: http://127.0.0.1:54321\r\n",
+            "Content-Length: 7\r\n",
+            "\r\n",
+            "{\"a\":1}"
+        );
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            read_request(&mut stream).unwrap()
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.write_all(raw.as_bytes()).unwrap();
+        let req = handle.join().unwrap().expect("request decoded");
+        assert_eq!(req.origin.as_deref(), Some("http://127.0.0.1:54321"));
+        assert_eq!(req.body, b"{\"a\":1}");
+    }
+
+    #[test]
+    fn respond_labels_403_forbidden() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            respond(
+                &mut stream,
+                403,
+                "text/plain; charset=utf-8",
+                "forbidden origin",
+            );
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        let _ = client.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut out = String::new();
+        client.read_to_string(&mut out).unwrap();
+        handle.join().unwrap();
+        assert!(
+            out.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+            "unexpected response head: {out}"
+        );
+        assert!(out.ends_with("forbidden origin"), "unexpected body: {out}");
+    }
+
+    /// End-to-end through the socket loop: `serve` must gate `POST /token`
+    /// on exactly the origin `obtain_token` prints for the page.
+    #[test]
+    fn serve_gates_posts_on_the_local_origin() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let origin = format!("http://127.0.0.1:{}", addr.port());
+        let (tx, rx) = mpsc::channel();
+        let serve_origin = origin.clone();
+        let _ = std::thread::spawn(move || {
+            serve(listener, "123****8901".to_string(), tx, serve_origin)
+        });
+
+        let post = |with_origin: &str| -> String {
+            let body = r#"{"captchaVerifyParam":"TOKEN123"}"#;
+            let raw = format!(
+                "POST /token HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: {with_origin}\r\n\
+                 Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let mut client = TcpStream::connect(addr).unwrap();
+            let _ = client.set_read_timeout(Some(Duration::from_secs(5)));
+            client.write_all(raw.as_bytes()).unwrap();
+            let mut out = String::new();
+            client.read_to_string(&mut out).unwrap();
+            out
+        };
+
+        let refused = post("http://evil.example");
+        assert!(
+            refused.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+            "unexpected response: {refused}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a cross-origin post must not deliver a token"
+        );
+
+        let accepted = post(&origin);
+        assert!(
+            accepted.starts_with("HTTP/1.1 200 OK\r\n"),
+            "unexpected response: {accepted}"
+        );
+        assert_eq!(rx.try_recv().unwrap(), "TOKEN123");
     }
 
     #[test]
