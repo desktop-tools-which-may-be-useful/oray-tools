@@ -304,7 +304,13 @@ fn mask_body(body: &str) -> String {
 }
 
 /// Whether `body` plausibly is a `k=v&k=v...` form body: non-empty, no bare
-/// line breaks, and every `&`-separated pair carries a `=`.
+/// line breaks, and at least **two** `&`-separated pairs each carrying a `=`.
+///
+/// Two pairs is the cheapest way to stay honest about "non-form text is kept
+/// verbatim": a single `key=value` line (`monkey=banana`, an error message, a
+/// config dump) must not be rewritten just because its key contains a
+/// sensitive substring, while every form body this tool actually sends or
+/// receives carries at least three pairs.
 fn looks_form_encoded(body: &str) -> bool {
     if body.is_empty() || body.contains('\n') || body.contains('\r') {
         return false;
@@ -316,7 +322,7 @@ fn looks_form_encoded(body: &str) -> bool {
         }
         pairs += 1;
     }
-    pairs > 0
+    pairs >= 2
 }
 
 /// Mask the values of sensitive keys in a form-encoded body, keeping every
@@ -525,6 +531,10 @@ mod tests {
         assert_eq!(mask_body("plain text body"), "plain text body");
         assert_eq!(mask_body(""), "");
         assert_eq!(mask_body("key only\nvalue=2"), "key only\nvalue=2");
+        // A single `k=v` line is not a form body: a sensitive *substring* in
+        // the key must not rewrite ordinary text (`monkey` contains `key`).
+        assert_eq!(mask_body("monkey=banana"), "monkey=banana");
+        assert_eq!(mask_body("expected key=value"), "expected key=value");
         // JSON behaviour is unchanged (pretty-printed, values masked).
         let masked = mask_body(r#"{"password":"abcdef123456","ok":true}"#);
         let parsed: serde_json::Value = serde_json::from_str(&masked).unwrap();

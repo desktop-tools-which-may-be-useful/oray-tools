@@ -285,6 +285,8 @@ oray-tools remote info <id>                  # extended detail
 oray-tools remote status <id>                # online state / last seen
 oray-tools remote rename <id> <new-name>     # rename (keeps the memo)
 oray-tools remote memo <id> <text>           # set the memo (keeps the name)
+# `remote status` resolves the id against the account's device list; a miss
+# reports `remote <id> not found among N remotes listed`.
 ```
 
 Every command accepts `--json` for machine-readable output and `--verbose`
@@ -331,13 +333,16 @@ The contract, identical in every command group:
   `wakeup plug on|off` (`status`), `wakeup plug led` (`led`),
   `wakeup plug power-on-restore` (`state`),
   `wakeup plug countdown start|stop`, `wakeup plug timer remove`
-  (`timer_id`), `wakeup plug timer enable|disable` (`timer_id`, `enabled`),
-  and the auth mutations (`auth login`, `auth login-sms`, `auth refresh`,
-  `auth logout`).
-- Shapes that already existed are unchanged: `plug status`, the `logs`
+  (`timer_id`), `wakeup plug timer enable|disable` (`timer_id`,
+  `enabled`), and the auth mutations (`auth login`, `auth login-sms`,
+  `auth refresh`, `auth logout`).
+- Shapes that already existed keep their keys: `plug status`, the `logs`
   array, the `timer list` array, `timer add`, `countdown status`,
   `wakeup list`/`info`, `remote list`/`info`/`status` and `auth status` —
   whose JSON never contains a token (`--show` only affects the text mode).
+  The one deliberate addition is `timer enable|disable`, which gained the
+  `ok` key above: additive, so a consumer that ignores unknown keys keeps
+  working.
 - `wakeup plug timer remove|enable|disable` now fail in **both** modes when
   the timer id is unknown (`error: ...`, exit 1); with `--json` an older
   build exited 0 or printed nothing there.
@@ -394,7 +399,8 @@ do not share it.
 Use `--config <path>` to point at a different file. `--clientid <id>`
 overrides the trusted Ex-ClientId of this run on **any** command — no longer
 only on `auth` — with the same semantics as `auth login --clientid`: the
-value is used for every request of the run and written into the config by
+value is used by the run's auth calls (the requests that carry `EX-ClientId`,
+i.e. login, refresh and code verification) and written into the config by
 the next save (login, logout, refresh, …). `--tz <offset>` overrides the
 timezone for a single run and accepts the same formats as the config value
 (e.g. `--tz +8h`, `--tz -05:30`, or `--tz +480min`).

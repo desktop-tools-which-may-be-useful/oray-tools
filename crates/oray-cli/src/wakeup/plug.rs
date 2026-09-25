@@ -494,6 +494,11 @@ fn json_timer_removed(sn: &str, index: usize, id: u64) -> serde_json::Value {
     serde_json::json!({ "ok": true, "sn": sn, "index": index, "timer_id": id })
 }
 
+/// `timer enable|disable` succeeded. Carries the uniform `ok` marker like
+/// every other mutating command — the one deliberate, documented exception to
+/// "an existing shape stays byte-identical": the added key is additive (only
+/// a `deny_unknown_fields` decoder could notice) and makes the success
+/// contract uniform for consumers.
 fn json_timer_enabled(sn: &str, index: usize, id: u64, enabled: bool) -> serde_json::Value {
     serde_json::json!({ "ok": true, "sn": sn, "index": index, "timer_id": id, "enabled": enabled })
 }
