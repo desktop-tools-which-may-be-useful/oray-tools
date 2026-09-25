@@ -285,8 +285,8 @@ oray-tools remote info <id>                  # extended detail
 oray-tools remote status <id>                # online state / last seen
 oray-tools remote rename <id> <new-name>     # rename (keeps the memo)
 oray-tools remote memo <id> <text>           # set the memo (keeps the name)
-# `remote status` resolves the id against the account's device list; a miss
-# reports `remote <id> not found among N remotes listed`.
+# `remote status|rename|memo` resolve the id against the account's device
+# list; a miss reports `remote <id> not found among N remotes listed`.
 ```
 
 Every command accepts `--json` for machine-readable output and `--verbose`
@@ -399,8 +399,9 @@ do not share it.
 Use `--config <path>` to point at a different file. `--clientid <id>`
 overrides the trusted Ex-ClientId of this run on **any** command — no longer
 only on `auth` — with the same semantics as `auth login --clientid`: the
-value is used by the run's auth calls (the requests that carry `EX-ClientId`,
-i.e. login, refresh and code verification) and written into the config by
+value is used by the run's auth calls (the requests that carry `EX-ClientId`:
+password/SMS login, requesting and verifying the SMS code, and refresh) and
+written into the config by
 the next save (login, logout, refresh, …). `--tz <offset>` overrides the
 timezone for a single run and accepts the same formats as the config value
 (e.g. `--tz +8h`, `--tz -05:30`, or `--tz +480min`).
