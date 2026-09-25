@@ -35,7 +35,8 @@ pub struct RequestLog {
 impl RequestLog {
     /// A copy safe for display or logging: the `Authorization` header value is
     /// shortened, and JSON request/response bodies have string values under
-    /// sensitive keys masked. Non-JSON bodies are kept verbatim.
+    /// sensitive keys masked. Form-encoded bodies (`k=v&k=v`) are masked the
+    /// same way by shape; anything else is kept verbatim.
     pub fn redacted(&self) -> RequestLog {
         let request_headers = self
             .request_headers
@@ -90,10 +91,21 @@ pub struct TracedError {
 }
 
 impl TracedError {
-    /// Whether the server reported an expired access token
-    /// (see [`Error::TokenExpired`]).
+    /// Whether the server reported an expired access token, so callers (e.g.
+    /// the CLI's `--refresh-on-expired`) can refresh and retry.
+    ///
+    /// Two shapes count as expired:
+    ///
+    /// * [`Error::TokenExpired`] — the body said so (`code 1010` /
+    ///   `TOKEN_EXPIRED`), and
+    /// * `401 Unauthorized` — some endpoints express expiry as a bare status
+    ///   with no recognizable body. `403 Forbidden` deliberately does *not*
+    ///   count: that is a permission problem a token refresh cannot fix.
     pub fn is_token_expired(&self) -> bool {
-        matches!(self.error, Error::TokenExpired(_))
+        matches!(
+            &self.error,
+            Error::TokenExpired(_) | Error::HttpStatus { status: 401, .. }
+        )
     }
 }
 
@@ -210,6 +222,43 @@ pub fn finish<T>(calls: Vec<RequestLog>, parsed: Result<T>) -> TracedResult<T> {
     }
 }
 
+/// The request headers shared by every `api-std.sunlogin.oray.com` call:
+/// `Authorization`, `Accept`, `User-Agent`, `X-Channel`, `Country-Region`.
+///
+/// Callers append endpoint-specific extras afterwards (e.g. `Content-Type`
+/// for a body), so the produced order matches what the endpoints already
+/// receive today.
+pub fn api_headers(token: &str) -> Vec<(String, String)> {
+    vec![
+        ("Authorization".into(), format!("Bearer {token}")),
+        ("Accept".into(), "application/json".into()),
+        ("User-Agent".into(), crate::USER_AGENT.into()),
+        ("X-Channel".into(), "OPPO".into()),
+        ("Country-Region".into(), "CN".into()),
+    ]
+}
+
+/// Unwrap an exchange that must be `2xx` into `(calls, body)`.
+///
+/// On a non-2xx status this builds the shared
+/// [`Error::HttpStatus`] — `"{what} failed (HTTP {status}): {body}"` — and
+/// carries the exchange, so callers get the identical message and trace they
+/// would have built by hand. This is the single place that check lives.
+pub fn expect_2xx(ex: Exchange, what: &'static str) -> RawResult<(Vec<RequestLog>, String)> {
+    let Exchange { log, status, text } = ex;
+    if !(200..300).contains(&status) {
+        return Err(TracedError {
+            error: Error::HttpStatus {
+                what,
+                status,
+                body: text,
+            },
+            calls: vec![log],
+        });
+    }
+    Ok((vec![log], text))
+}
+
 fn sensitive_key(key: &str) -> bool {
     const KEYS: &[&str] = &[
         "token",
@@ -242,11 +291,54 @@ fn mask_authorization(s: &str) -> String {
 }
 
 fn mask_body(body: &str) -> String {
-    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(body) else {
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(mut value) => {
+            mask_value(&mut value);
+            serde_json::to_string_pretty(&value).unwrap_or_else(|_| body.to_string())
+        }
+        // Not JSON: `application/x-www-form-urlencoded` bodies (the plug
+        // endpoints answer with these) are masked by shape instead — the
+        // trace does not carry the response `Content-Type`.
+        Err(_) => mask_form_body(body),
+    }
+}
+
+/// Whether `body` plausibly is a `k=v&k=v...` form body: non-empty, no bare
+/// line breaks, and every `&`-separated pair carries a `=`.
+fn looks_form_encoded(body: &str) -> bool {
+    if body.is_empty() || body.contains('\n') || body.contains('\r') {
+        return false;
+    }
+    let mut pairs = 0usize;
+    for pair in body.split('&') {
+        if !pair.contains('=') {
+            return false;
+        }
+        pairs += 1;
+    }
+    pairs > 0
+}
+
+/// Mask the values of sensitive keys in a form-encoded body, keeping every
+/// key, order and separator byte-identical otherwise (so a body without
+/// sensitive keys round-trips unchanged, and a body that only looks similar
+/// is never rewritten).
+///
+/// Keys/values are compared as they appear on the wire (these bodies are
+/// plain ASCII `key=value` pairs in practice), and the signature stays
+/// `&str -> String` because a [`RequestLog`] records no response
+/// `Content-Type` to dispatch on.
+fn mask_form_body(body: &str) -> String {
+    if !looks_form_encoded(body) {
         return body.to_string();
-    };
-    mask_value(&mut value);
-    serde_json::to_string_pretty(&value).unwrap_or_else(|_| body.to_string())
+    }
+    body.split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((key, value)) if sensitive_key(key) => format!("{key}={}", mask_str(value)),
+            _ => pair.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 fn mask_value(value: &mut serde_json::Value) {
@@ -340,5 +432,103 @@ mod tests {
         assert_eq!(mask_authorization("abc"), "abc***");
         assert_eq!(mask_authorization("Bearer ab"), "Bearer ab***");
         assert!(mask_authorization("Bearer abcdef012345").ends_with("***"));
+    }
+
+    /// Servers that signal expiry with a bare `401` (no recognizable body)
+    /// must still trigger the refresh-and-retry path; `403` must not.
+    #[test]
+    fn token_expired_by_status_401_only() {
+        let http = |status: u16| TracedError {
+            error: Error::HttpStatus {
+                what: "list remotes",
+                status,
+                body: "unauthorized".into(),
+            },
+            calls: Vec::new(),
+        };
+        assert!(http(401).is_token_expired());
+        assert!(!http(403).is_token_expired());
+        assert!(!http(404).is_token_expired());
+        assert!(TracedError::from(Error::TokenExpired("TOKEN_EXPIRED".into())).is_token_expired());
+        assert!(
+            !TracedError::from(Error::Api("sn=101000000001 not found".into())).is_token_expired()
+        );
+    }
+
+    fn exchange(status: u16, text: &str) -> Exchange {
+        Exchange {
+            log: RequestLog {
+                method: "GET".into(),
+                url: "https://api.example/x".into(),
+                request_headers: Vec::new(),
+                request_body: None,
+                status: Some(status),
+                response_body: text.to_string(),
+            },
+            status,
+            text: text.to_string(),
+        }
+    }
+
+    /// The shared 2xx gate must produce exactly the `Error::HttpStatus`
+    /// message the hand-written checks produced before.
+    #[test]
+    fn expect_2xx_returns_body_or_status_error() {
+        let (calls, text) = expect_2xx(exchange(200, "{\"ok\":true}"), "list remotes").unwrap();
+        assert_eq!(text, "{\"ok\":true}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].status, Some(200));
+
+        let err = expect_2xx(exchange(500, "boom"), "list remotes").unwrap_err();
+        assert!(
+            matches!(
+                &err.error,
+                Error::HttpStatus { what, status, body }
+                    if *what == "list remotes" && *status == 500 && body == "boom"
+            ),
+            "unexpected error: {:?}",
+            err.error
+        );
+        assert_eq!(err.to_string(), "list remotes failed (HTTP 500): boom");
+        assert_eq!(err.calls.len(), 1);
+        assert_eq!(err.calls[0].status, Some(500));
+    }
+
+    #[test]
+    fn api_headers_are_ordered_and_bearer() {
+        let headers = api_headers("tok");
+        assert_eq!(
+            headers.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            [
+                "Authorization",
+                "Accept",
+                "User-Agent",
+                "X-Channel",
+                "Country-Region"
+            ]
+        );
+        assert_eq!(headers[0].1, "Bearer tok");
+    }
+
+    #[test]
+    fn mask_form_encoded_bodies() {
+        // Sensitive pair masked, everything else byte-identical.
+        assert_eq!(
+            mask_body("account=a&password=abcdef123456&sn=123"),
+            "account=a&password=abcd***&sn=123"
+        );
+        // Case-insensitive key match, encoded values kept in place.
+        assert_eq!(mask_body("Token=abcdef&x=1"), "Token=abcd***&x=1");
+        // No sensitive key: unchanged.
+        assert_eq!(mask_body("account=a&sn=123"), "account=a&sn=123");
+        // Shape that is not a form body: untouched.
+        assert_eq!(mask_body("plain text body"), "plain text body");
+        assert_eq!(mask_body(""), "");
+        assert_eq!(mask_body("key only\nvalue=2"), "key only\nvalue=2");
+        // JSON behaviour is unchanged (pretty-printed, values masked).
+        let masked = mask_body(r#"{"password":"abcdef123456","ok":true}"#);
+        let parsed: serde_json::Value = serde_json::from_str(&masked).unwrap();
+        assert_eq!(parsed["password"], "abcd***");
+        assert_eq!(parsed["ok"], true);
     }
 }
