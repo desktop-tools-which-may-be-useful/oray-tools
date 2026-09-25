@@ -37,17 +37,80 @@ pub struct AuthApi {
     shield_base: String,
 }
 
+/// The `refresh_expires` field of an [`AuthResponse`], typed.
+///
+/// The service is inconsistent: the value may be absent, `null`, a JSON
+/// number, a numeric string — or something unusable. Deserialization is
+/// deliberately forgiving: anything that does not yield a number degrades to
+/// [`RefreshExpires::Unknown`] instead of failing the whole response, so a
+/// login/refresh never breaks over an expiry hint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RefreshExpires {
+    /// Absent / `null` / not a usable number: fall back to `refresh_ttl`.
+    #[default]
+    Unknown,
+    /// An absolute unix timestamp (seconds).
+    Timestamp(i64),
+}
+
+impl<'de> Deserialize<'de> for RefreshExpires {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        Ok(match raw {
+            serde_json::Value::Null => RefreshExpires::Unknown,
+            n if n.is_i64() || n.is_u64() => match n.as_i64() {
+                Some(ts) => RefreshExpires::Timestamp(ts),
+                None => RefreshExpires::Unknown,
+            },
+            serde_json::Value::String(s) => match s.parse::<i64>() {
+                Ok(ts) => RefreshExpires::Timestamp(ts),
+                Err(_) => RefreshExpires::Unknown,
+            },
+            _ => RefreshExpires::Unknown,
+        })
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct AuthResponse {
     pub access_token: String,
     pub refresh_token: String,
-    // May be absent; when present it's a string timestamp. Be tolerant of numbers.
+    // May be absent, null, a number or a numeric string — see RefreshExpires.
     #[serde(default)]
-    pub refresh_expires: serde_json::Value,
+    pub refresh_expires: RefreshExpires,
     // login response: seconds of TTL (e.g. 2592000);
     // refresh response: an absolute unix timestamp (field is misnamed).
     #[serde(default)]
     pub refresh_ttl: Option<u64>,
+}
+
+/// Absolute unix timestamp (seconds) at which `refresh_token` expires.
+///
+/// This is the single place that knows how ambiguous the two expiry fields
+/// are: `refresh_expires` may be an absolute timestamp (number or numeric
+/// string), while the misnamed `refresh_ttl` is a TTL in seconds on login
+/// responses but an absolute timestamp on refresh responses. The rules, in
+/// order:
+///
+/// 1. `refresh_expires` parses to a number → that absolute timestamp;
+/// 2. `refresh_ttl` greater than 10 years of seconds → treated as absolute;
+/// 3. `refresh_ttl` otherwise → `now + ttl`;
+/// 4. nothing usable → `now + 30 days`.
+///
+/// Pure: `now` comes from the caller, so the heuristics are testable.
+pub fn refresh_expires_at(resp: &AuthResponse, now: i64) -> i64 {
+    if let RefreshExpires::Timestamp(ts) = resp.refresh_expires {
+        return ts;
+    }
+    const TEN_YEARS: u64 = 10 * 365 * 24 * 3600;
+    match resp.refresh_ttl {
+        Some(ttl) if ttl > TEN_YEARS => ttl as i64,
+        Some(ttl) => now + ttl as i64,
+        None => now + 30 * 24 * 3600,
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -481,5 +544,101 @@ mod tests {
         assert_eq!(parsed.access_token, "a");
         assert_eq!(parsed.refresh_token, "b");
         assert_eq!(parsed.refresh_ttl, Some(1792913498));
+    }
+
+    /// A response parsed exactly like the HTTP layer parses it.
+    fn resp(raw: &str) -> AuthResponse {
+        serde_json::from_str(raw).unwrap()
+    }
+
+    /// Fixed clock for the pure `refresh_expires_at` heuristic.
+    const NOW: i64 = 1_800_000_000;
+    const TEN_YEARS: i64 = 10 * 365 * 24 * 3600;
+    const THIRTY_DAYS: i64 = 30 * 24 * 3600;
+
+    /// A numeric `refresh_expires` is an absolute timestamp.
+    #[test]
+    fn refresh_expires_number_is_absolute() {
+        let r = resp(r#"{"access_token":"a","refresh_token":"b","refresh_expires":1790000000}"#);
+        assert_eq!(r.refresh_expires, RefreshExpires::Timestamp(1_790_000_000));
+        assert_eq!(refresh_expires_at(&r, NOW), 1_790_000_000);
+    }
+
+    /// So is a numeric string (`"1790000000"`).
+    #[test]
+    fn refresh_expires_numeric_string_is_absolute() {
+        let r = resp(r#"{"access_token":"a","refresh_token":"b","refresh_expires":"1790000000"}"#);
+        assert_eq!(r.refresh_expires, RefreshExpires::Timestamp(1_790_000_000));
+        assert_eq!(refresh_expires_at(&r, NOW), 1_790_000_000);
+    }
+
+    /// `refresh_expires` wins over `refresh_ttl`.
+    #[test]
+    fn refresh_expires_beats_refresh_ttl() {
+        let r = resp(
+            r#"{"access_token":"a","refresh_token":"b","refresh_expires":1790000000,"refresh_ttl":60}"#,
+        );
+        assert_eq!(refresh_expires_at(&r, NOW), 1_790_000_000);
+    }
+
+    /// A login-shaped `refresh_ttl` is a TTL in seconds: `now + ttl`.
+    #[test]
+    fn refresh_ttl_is_relative() {
+        let r = resp(r#"{"access_token":"a","refresh_token":"b","refresh_ttl":2592000}"#);
+        assert_eq!(refresh_expires_at(&r, NOW), NOW + 2_592_000);
+    }
+
+    /// The 10-year threshold: exactly at it the value is still a TTL, one
+    /// second above it it is treated as an absolute timestamp.
+    #[test]
+    fn refresh_ttl_threshold_between_relative_and_absolute() {
+        let at = resp(&format!(
+            r#"{{"access_token":"a","refresh_token":"b","refresh_ttl":{TEN_YEARS}}}"#
+        ));
+        assert_eq!(refresh_expires_at(&at, NOW), NOW + TEN_YEARS);
+
+        let above = resp(&format!(
+            r#"{{"access_token":"a","refresh_token":"b","refresh_ttl":{}}}"#,
+            TEN_YEARS + 1
+        ));
+        assert_eq!(refresh_expires_at(&above, NOW), TEN_YEARS + 1);
+    }
+
+    /// Nothing usable at all: assume 30 days.
+    #[test]
+    fn missing_expiry_defaults_to_thirty_days() {
+        let r = resp(r#"{"access_token":"a","refresh_token":"b"}"#);
+        assert_eq!(r.refresh_expires, RefreshExpires::Unknown);
+        assert_eq!(refresh_expires_at(&r, NOW), NOW + THIRTY_DAYS);
+    }
+
+    /// `refresh_expires: null` degrades to "unknown" and the TTL (or the
+    /// 30-day default) is used instead — deserialization never fails.
+    #[test]
+    fn refresh_expires_null_degrades_to_ttl_fallback() {
+        let with_ttl = resp(
+            r#"{"access_token":"a","refresh_token":"b","refresh_expires":null,"refresh_ttl":60}"#,
+        );
+        assert_eq!(with_ttl.refresh_expires, RefreshExpires::Unknown);
+        assert_eq!(refresh_expires_at(&with_ttl, NOW), NOW + 60);
+
+        let without = resp(r#"{"access_token":"a","refresh_token":"b","refresh_expires":null}"#);
+        assert_eq!(refresh_expires_at(&without, NOW), NOW + THIRTY_DAYS);
+    }
+
+    /// Unusable shapes (non-numeric string, object) are tolerated by the
+    /// deserializer and fall back like a missing field.
+    #[test]
+    fn refresh_expires_garbage_is_tolerated() {
+        for raw in [
+            r#"{"access_token":"a","refresh_token":"b","refresh_expires":"soon"}"#,
+            r#"{"access_token":"a","refresh_token":"b","refresh_expires":{"odd":true}}"#,
+            r#"{"access_token":"a","refresh_token":"b","refresh_expires":true}"#,
+            r#"{"access_token":"a","refresh_token":"b","refresh_expires":1.5}"#,
+        ] {
+            let r = resp(raw);
+            assert_eq!(r.refresh_expires, RefreshExpires::Unknown, "{raw}");
+            assert_eq!(refresh_expires_at(&r, NOW), NOW + THIRTY_DAYS, "{raw}");
+        }
     }
 }

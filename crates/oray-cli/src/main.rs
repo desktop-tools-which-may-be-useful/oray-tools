@@ -155,6 +155,17 @@ fn run(mut cli: Cli) -> Result<()> {
         .timeout(std::time::Duration::from_secs(20))
         .build()?;
     let (mut cfg, path) = Config::load(cli.config.as_ref())?;
+    // `--clientid` overrides the trusted client id for this run and is
+    // persisted by the next save — the same semantics as
+    // `auth login --clientid`. Writing it into the config *before* anything
+    // is filled in or dispatched is what makes it reach every command:
+    // wakeup/remote token refreshes only read `cfg.client` (through
+    // `support::resolve_clientid`), they never see the raw CLI flag.
+    if let Some(cid) = cli.clientid.as_deref().filter(|c| !c.is_empty()) {
+        cfg.client = Some(config::Client {
+            clientid: cid.to_string(),
+        });
+    }
     // --interactive: complete the missing arguments before anything is
     // fetched or sent (and before anything can block on stdin unnoticed).
     // Without the flag the parse above already rejected every missing value,

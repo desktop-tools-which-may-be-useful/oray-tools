@@ -36,8 +36,12 @@ pub enum AuthCmd {
     },
     /// Renew tokens with the saved refresh_token
     Refresh,
-    /// Show current token info and expiry
-    Status,
+    /// Show current token info and expiry (tokens masked by default)
+    Status {
+        /// Print the access/refresh tokens in full instead of masking them
+        #[arg(long)]
+        show: bool,
+    },
     /// Clear saved tokens and account
     Logout,
 }
@@ -83,8 +87,8 @@ pub fn fill(cmd: &mut AuthCmd, cfg: &Config) -> Result<()> {
                 check_mobile,
             )
         }
-        // Nothing to complete: no arguments at all.
-        AuthCmd::Refresh | AuthCmd::Status | AuthCmd::Logout => Ok(()),
+        // Nothing to complete: no arguments at all (`--show` is a flag).
+        AuthCmd::Refresh | AuthCmd::Status { .. } | AuthCmd::Logout => Ok(()),
     }
 }
 
@@ -129,7 +133,7 @@ pub fn run(
             )
         }
         AuthCmd::Refresh => do_refresh(http, cfg, path, clientid, json),
-        AuthCmd::Status => do_status(cfg, json),
+        AuthCmd::Status { show } => do_status(cfg, json, show),
         AuthCmd::Logout => do_logout(cfg, path, json),
     }
 }
@@ -359,7 +363,7 @@ fn do_refresh(
     Ok(())
 }
 
-fn do_status(cfg: &Config, json: bool) -> Result<()> {
+fn do_status(cfg: &Config, json: bool, show: bool) -> Result<()> {
     if json {
         let access_expiry = cfg
             .token
@@ -374,7 +378,7 @@ fn do_status(cfg: &Config, json: bool) -> Result<()> {
         emit_json(true, &v)?;
         return Ok(());
     }
-    print_tokens(cfg);
+    print_tokens(cfg, show);
     Ok(())
 }
 
