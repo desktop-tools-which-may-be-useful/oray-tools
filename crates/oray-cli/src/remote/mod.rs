@@ -4,8 +4,9 @@
 //! thin, so everything lives in this `mod.rs`.
 
 use crate::config::Config;
+use crate::prompt;
 use crate::support::{emit_json, with_token};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Subcommand;
 use oray_core::remote::{RemoteApi, RemoteUpdate};
 use reqwest::blocking::Client as HttpClient;
@@ -18,27 +19,58 @@ pub enum RemoteCmd {
     /// Show extended detail for one remote (by remote id)
     Info {
         /// Remote device id
-        id: u64,
+        id: Option<u64>,
     },
     /// Show runtime status of one remote
     Status {
         /// Remote device id
-        id: u64,
+        id: Option<u64>,
     },
     /// Rename a remote device
     Rename {
         /// Remote device id
-        id: u64,
+        id: Option<u64>,
         /// New device name
-        new_name: String,
+        new_name: Option<String>,
     },
     /// Set the memo of a remote device
     Memo {
         /// Remote device id
-        id: u64,
+        id: Option<u64>,
         /// New memo text
-        new_memo: String,
+        new_memo: Option<String>,
     },
+}
+
+/// `--interactive`: type the arguments this command line left out.
+pub fn fill(cmd: &mut RemoteCmd) -> Result<()> {
+    match cmd {
+        RemoteCmd::List => Ok(()),
+        RemoteCmd::Info { id } => {
+            prompt::require_terminal(&[("<ID>", id.is_none())], "oray-tools remote info <id>")?;
+            prompt::fill_parsed(id, "Remote id")
+        }
+        RemoteCmd::Status { id } => {
+            prompt::require_terminal(&[("<ID>", id.is_none())], "oray-tools remote status <id>")?;
+            prompt::fill_parsed(id, "Remote id")
+        }
+        RemoteCmd::Rename { id, new_name } => {
+            prompt::require_terminal(
+                &[("<ID>", id.is_none()), ("<NEW_NAME>", new_name.is_none())],
+                "oray-tools remote rename <id> <new_name>",
+            )?;
+            prompt::fill_parsed(id, "Remote id")?;
+            prompt::fill_str(new_name, "New device name", None)
+        }
+        RemoteCmd::Memo { id, new_memo } => {
+            prompt::require_terminal(
+                &[("<ID>", id.is_none()), ("<NEW_MEMO>", new_memo.is_none())],
+                "oray-tools remote memo <id> <new_memo>",
+            )?;
+            prompt::fill_parsed(id, "Remote id")?;
+            prompt::fill_str(new_memo, "New memo", None)
+        }
+    }
 }
 
 pub fn run(
@@ -78,6 +110,7 @@ pub fn run(
             Ok(())
         }
         RemoteCmd::Info { id } => {
+            let id = id.context("missing <ID>")?;
             let detail = with_token(http, cfg, path, refresh_on_expired, |tok| {
                 api.detail(tok, id)
             })?;
@@ -115,6 +148,7 @@ pub fn run(
             Ok(())
         }
         RemoteCmd::Status { id } => {
+            let id = id.context("missing <ID>")?;
             let remote = with_token(http, cfg, path, refresh_on_expired, |tok| api.find(tok, id))?;
             emit_json(json, &remote)?;
             if !json {
@@ -146,6 +180,8 @@ pub fn run(
             Ok(())
         }
         RemoteCmd::Rename { id, new_name } => {
+            let id = id.context("missing <ID>")?;
+            let new_name = new_name.as_deref().context("missing <NEW_NAME>")?;
             // Preserve the memo: fetch the current description first, then send
             // both fields together (the PATCH endpoint always updates both).
             let current = with_token(http, cfg, path, refresh_on_expired, |tok| api.find(tok, id))?;
@@ -153,7 +189,7 @@ pub fn run(
                 api.update(
                     tok,
                     id,
-                    &RemoteUpdate::new(&new_name, &current.info.description),
+                    &RemoteUpdate::new(new_name, &current.info.description),
                 )
             })?;
             if !json {
@@ -162,9 +198,11 @@ pub fn run(
             Ok(())
         }
         RemoteCmd::Memo { id, new_memo } => {
+            let id = id.context("missing <ID>")?;
+            let new_memo = new_memo.as_deref().context("missing <NEW_MEMO>")?;
             let current = with_token(http, cfg, path, refresh_on_expired, |tok| api.find(tok, id))?;
             with_token(http, cfg, path, refresh_on_expired, |tok| {
-                api.update(tok, id, &RemoteUpdate::new(&current.info.name, &new_memo))
+                api.update(tok, id, &RemoteUpdate::new(&current.info.name, new_memo))
             })?;
             if !json {
                 println!("memo of remote {id} set to '{new_memo}'");

@@ -7,12 +7,14 @@
 //! are local time with weekdays starting Monday. The helpers below convert
 //! between the two representations given a timezone offset in minutes.
 
+use super::{SN_LABEL, fill_sn};
 use crate::config::Config;
+use crate::prompt;
 use crate::support::{
     emit_json, parse_ago_secs, parse_on_off, render_ts, resolve_time_bound_tz, resolve_tz,
     tz_label, with_token,
 };
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use clap::Subcommand;
 use oray_core::wakeup::plug::{PlugApi, PlugTimer, StatusLog, StatusLogsData};
@@ -151,7 +153,7 @@ pub enum PlugCmd {
     /// Query plug status
     Status {
         /// Device serial number
-        sn: String,
+        sn: Option<String>,
         /// Port index (default: 0, the master switch)
         #[arg(long, default_value_t = 0)]
         index: usize,
@@ -159,7 +161,7 @@ pub enum PlugCmd {
     /// Turn the plug on
     On {
         /// Device serial number
-        sn: String,
+        sn: Option<String>,
         /// Port index (default: 0)
         #[arg(long, default_value_t = 0)]
         index: usize,
@@ -167,7 +169,7 @@ pub enum PlugCmd {
     /// Turn the plug off
     Off {
         /// Device serial number
-        sn: String,
+        sn: Option<String>,
         /// Port index (default: 0)
         #[arg(long, default_value_t = 0)]
         index: usize,
@@ -175,7 +177,7 @@ pub enum PlugCmd {
     /// Fetch status-change logs
     Logs {
         /// Device serial number
-        sn: String,
+        sn: Option<String>,
         /// Port index
         #[arg(long, default_value_t = 0)]
         index: usize,
@@ -208,16 +210,16 @@ pub enum PlugCmd {
     /// Control the LED indicator
     Led {
         /// Device serial number
-        sn: String,
+        sn: Option<String>,
         /// on or off
-        state: String,
+        state: Option<String>,
     },
     /// Set the state after a power loss: 0 = off, 2 = keep last state
     PowerOnRestore {
         /// Device serial number
-        sn: String,
+        sn: Option<String>,
         /// 0 (off) or 2 (keep last state)
-        state: u32,
+        state: Option<u32>,
     },
 }
 
@@ -226,7 +228,7 @@ pub enum TimerCmd {
     /// List timers for an outlet
     List {
         /// Device serial number
-        sn: String,
+        sn: Option<String>,
         /// Port index (default: 0)
         #[arg(long, default_value_t = 0)]
         index: usize,
@@ -234,14 +236,14 @@ pub enum TimerCmd {
     /// Add a timer that fires at a local clock time on the matching days
     Add {
         /// Device serial number
-        sn: String,
+        sn: Option<String>,
         /// Port index (default: 0)
         #[arg(long, default_value_t = 0)]
         index: usize,
         /// Local time when the timer fires: a clock time like 19:25 (or
         /// 8:05), or minutes of the day 0-1439 (e.g. 480 = 08:00)
         #[arg(long)]
-        time: String,
+        time: Option<String>,
         /// Resulting state: 0 = off, 1 = on (default: 1)
         #[arg(long, default_value_t = 1)]
         action: u8,
@@ -255,9 +257,9 @@ pub enum TimerCmd {
     /// Remove a timer by its timer id
     Remove {
         /// Device serial number
-        sn: String,
+        sn: Option<String>,
         /// Timer id (see `timer list`)
-        id: u64,
+        id: Option<u64>,
         /// Port index (default: 0)
         #[arg(long, default_value_t = 0)]
         index: usize,
@@ -265,9 +267,9 @@ pub enum TimerCmd {
     /// Enable a timer by its timer id
     Enable {
         /// Device serial number
-        sn: String,
+        sn: Option<String>,
         /// Timer id (see `timer list`)
-        id: u64,
+        id: Option<u64>,
         /// Port index (default: 0)
         #[arg(long, default_value_t = 0)]
         index: usize,
@@ -275,9 +277,9 @@ pub enum TimerCmd {
     /// Disable a timer by its timer id (keeps it configured but inactive)
     Disable {
         /// Device serial number
-        sn: String,
+        sn: Option<String>,
         /// Timer id (see `timer list`)
-        id: u64,
+        id: Option<u64>,
         /// Port index (default: 0)
         #[arg(long, default_value_t = 0)]
         index: usize,
@@ -289,7 +291,7 @@ pub enum CountdownCmd {
     /// Show the running countdown for an outlet
     Status {
         /// Device serial number
-        sn: String,
+        sn: Option<String>,
         /// Port index (default: 0)
         #[arg(long, default_value_t = 0)]
         index: usize,
@@ -297,13 +299,13 @@ pub enum CountdownCmd {
     /// Start a countdown that flips the outlet after `count` seconds
     Start {
         /// Device serial number
-        sn: String,
+        sn: Option<String>,
         /// Port index (default: 0)
         #[arg(long, default_value_t = 0)]
         index: usize,
         /// Seconds until the outlet switches
         #[arg(long)]
-        count: u64,
+        count: Option<u64>,
         /// Resulting state when the countdown ends: 0 = off, 1 = on (default: 0)
         #[arg(long, default_value_t = 0)]
         action: u8,
@@ -311,13 +313,100 @@ pub enum CountdownCmd {
     /// Stop any running countdown
     Stop {
         /// Device serial number
-        sn: String,
+        sn: Option<String>,
         /// Port index (default: 0)
         #[arg(long, default_value_t = 0)]
         index: usize,
     },
 }
 
+/// `--interactive`: type the arguments this command line left out.
+pub fn fill(cmd: &mut PlugCmd) -> Result<()> {
+    match cmd {
+        PlugCmd::Status { sn, .. } => fill_sn(sn, "oray-tools wakeup plug status <sn>"),
+        PlugCmd::On { sn, .. } => fill_sn(sn, "oray-tools wakeup plug on <sn>"),
+        PlugCmd::Off { sn, .. } => fill_sn(sn, "oray-tools wakeup plug off <sn>"),
+        PlugCmd::Logs { sn, .. } => fill_sn(sn, "oray-tools wakeup plug logs <sn>"),
+        PlugCmd::Led { sn, state } => {
+            prompt::require_terminal(
+                &[("<SN>", sn.is_none()), ("<STATE>", state.is_none())],
+                "oray-tools wakeup plug led <sn> <state>",
+            )?;
+            prompt::fill_str(sn, SN_LABEL, None)?;
+            prompt::fill_checked(state, "LED state (on/off)", None, |value| {
+                crate::support::parse_on_off(value).map(|_| ())
+            })
+        }
+        PlugCmd::PowerOnRestore { sn, state } => {
+            prompt::require_terminal(
+                &[("<SN>", sn.is_none()), ("<STATE>", state.is_none())],
+                "oray-tools wakeup plug power-on-restore <sn> <state>",
+            )?;
+            prompt::fill_str(sn, SN_LABEL, None)?;
+            prompt::fill_parsed(state, "Power-on state (0 = off, 2 = keep last)")
+        }
+        PlugCmd::Timer { sub } => fill_timer(sub),
+        PlugCmd::Countdown { sub } => fill_countdown(sub),
+    }
+}
+
+/// `--interactive` for `wakeup plug timer <SUB>`.
+fn fill_timer(cmd: &mut TimerCmd) -> Result<()> {
+    match cmd {
+        TimerCmd::List { sn, .. } => fill_sn(sn, "oray-tools wakeup plug timer list <sn>"),
+        TimerCmd::Add { sn, time, .. } => {
+            prompt::require_terminal(
+                &[("<SN>", sn.is_none()), ("<TIME>", time.is_none())],
+                "oray-tools wakeup plug timer add <sn> --time <TIME>",
+            )?;
+            prompt::fill_str(sn, SN_LABEL, None)?;
+            prompt::fill_checked(time, "Timer time (e.g. 19:25)", None, |value| {
+                if crate::support::parse_local_time(value).is_some() {
+                    Ok(())
+                } else {
+                    bail!(
+                        "use a local clock time like 19:25, or minutes of the day 0-1439 \
+                         (e.g. 480 = 08:00), got '{value}'"
+                    )
+                }
+            })
+        }
+        TimerCmd::Remove { sn, id, .. } => {
+            fill_sn_id(sn, id, "oray-tools wakeup plug timer remove <sn> <id>")
+        }
+        TimerCmd::Enable { sn, id, .. } => {
+            fill_sn_id(sn, id, "oray-tools wakeup plug timer enable <sn> <id>")
+        }
+        TimerCmd::Disable { sn, id, .. } => {
+            fill_sn_id(sn, id, "oray-tools wakeup plug timer disable <sn> <id>")
+        }
+    }
+}
+
+/// Prompt for `<SN>` and the `<ID>` of a timer.
+fn fill_sn_id(sn: &mut Option<String>, id: &mut Option<u64>, example: &str) -> Result<()> {
+    prompt::require_terminal(&[("<SN>", sn.is_none()), ("<ID>", id.is_none())], example)?;
+    prompt::fill_str(sn, SN_LABEL, None)?;
+    prompt::fill_parsed(id, "Timer id (see `timer list`)")
+}
+
+/// `--interactive` for `wakeup plug countdown <SUB>`.
+fn fill_countdown(cmd: &mut CountdownCmd) -> Result<()> {
+    match cmd {
+        CountdownCmd::Status { sn, .. } => {
+            fill_sn(sn, "oray-tools wakeup plug countdown status <sn>")
+        }
+        CountdownCmd::Start { sn, count, .. } => {
+            prompt::require_terminal(
+                &[("<SN>", sn.is_none()), ("<COUNT>", count.is_none())],
+                "oray-tools wakeup plug countdown start <sn> --count <COUNT>",
+            )?;
+            prompt::fill_str(sn, SN_LABEL, None)?;
+            prompt::fill_parsed(count, "Countdown seconds")
+        }
+        CountdownCmd::Stop { sn, .. } => fill_sn(sn, "oray-tools wakeup plug countdown stop <sn>"),
+    }
+}
 pub fn run(
     http: &HttpClient,
     cfg: &mut Config,
@@ -331,8 +420,9 @@ pub fn run(
     let plug = PlugApi::new(http.clone(), &server.slapi_base);
     match sub {
         PlugCmd::Status { sn, index } => {
+            let sn = sn.as_deref().context("missing <SN>")?;
             let resp = with_token(http, cfg, path, refresh_on_expired, |tok| {
-                plug.get_status(tok, &sn, index)
+                plug.get_status(tok, sn, index)
             })?;
             emit_json(json, &resp)?;
             if !json {
@@ -348,8 +438,9 @@ pub fn run(
             Ok(())
         }
         PlugCmd::On { sn, index } => {
+            let sn = sn.as_deref().context("missing <SN>")?;
             with_token(http, cfg, path, refresh_on_expired, |tok| {
-                plug.set_status(tok, &sn, index, true)
+                plug.set_status(tok, sn, index, true)
             })?;
             if !json {
                 println!("sn={sn} index={index} ON");
@@ -357,8 +448,9 @@ pub fn run(
             Ok(())
         }
         PlugCmd::Off { sn, index } => {
+            let sn = sn.as_deref().context("missing <SN>")?;
             with_token(http, cfg, path, refresh_on_expired, |tok| {
-                plug.set_status(tok, &sn, index, false)
+                plug.set_status(tok, sn, index, false)
             })?;
             if !json {
                 println!("sn={sn} index={index} OFF");
@@ -372,6 +464,7 @@ pub fn run(
             until,
             page,
         } => {
+            let sn = sn.as_deref().context("missing <SN>")?;
             let now = Utc::now().timestamp();
             // Absolute wall-clock bounds are interpreted in the plug's
             // timezone (--tz > config tz > machine local); ago bounds are
@@ -413,7 +506,7 @@ pub fn run(
             let mut all: Vec<StatusLog> = Vec::new();
             match page {
                 Some(p) => {
-                    let data = fetch_logs_page(http, cfg, path, refresh_on_expired, &plug, &sn, p)?;
+                    let data = fetch_logs_page(http, cfg, path, refresh_on_expired, &plug, sn, p)?;
                     all.extend(data.logs.into_iter().filter(&keep));
                 }
                 None => {
@@ -421,8 +514,7 @@ pub fn run(
                     // binary-search the first/last page that can intersect the
                     // window (probing ~log2(pages)) and read only that slice,
                     // instead of walking from page 1.
-                    let first =
-                        fetch_logs_page(http, cfg, path, refresh_on_expired, &plug, &sn, 1)?;
+                    let first = fetch_logs_page(http, cfg, path, refresh_on_expired, &plug, sn, 1)?;
                     let total = first.totalpage.max(1);
                     let mut cached: Vec<Option<StatusLogsData>> =
                         (0..=total).map(|_| None).collect();
@@ -443,7 +535,7 @@ pub fn run(
                                     path,
                                     refresh_on_expired,
                                     &plug,
-                                    &sn,
+                                    sn,
                                     mid,
                                     &mut cached,
                                 )?;
@@ -475,7 +567,7 @@ pub fn run(
                                     path,
                                     refresh_on_expired,
                                     &plug,
-                                    &sn,
+                                    sn,
                                     mid,
                                     &mut cached,
                                 )?;
@@ -504,7 +596,7 @@ pub fn run(
                                     path,
                                     refresh_on_expired,
                                     &plug,
-                                    &sn,
+                                    sn,
                                     p,
                                 )?);
                             }
@@ -551,9 +643,11 @@ pub fn run(
             do_countdown(http, cfg, path, &plug, sub, refresh_on_expired, json)
         }
         PlugCmd::Led { sn, state } => {
-            let enabled = parse_on_off(&state)?;
+            let sn = sn.as_deref().context("missing <SN>")?;
+            let state = state.as_deref().context("missing <STATE>")?;
+            let enabled = parse_on_off(state)?;
             with_token(http, cfg, path, refresh_on_expired, |tok| {
-                plug.set_led(tok, &sn, enabled)
+                plug.set_led(tok, sn, enabled)
             })?;
             if !json {
                 println!("sn={sn} led {}", if enabled { "ON" } else { "OFF" });
@@ -561,11 +655,13 @@ pub fn run(
             Ok(())
         }
         PlugCmd::PowerOnRestore { sn, state } => {
+            let sn = sn.as_deref().context("missing <SN>")?;
+            let state = state.context("missing <STATE>")?;
             if state != 0 && state != 2 {
                 bail!("power-on-restore state must be 0 (off) or 2 (keep last state), got {state}");
             }
             with_token(http, cfg, path, refresh_on_expired, |tok| {
-                plug.set_dfltstat(tok, &sn, state)
+                plug.set_dfltstat(tok, sn, state)
             })?;
             if !json {
                 println!("sn={sn} power-on-restore={state}");
@@ -587,9 +683,10 @@ fn do_timer(
 ) -> Result<()> {
     match sub {
         TimerCmd::List { sn, index } => {
+            let sn = sn.as_deref().context("missing <SN>")?;
             let tz = resolve_tz(cfg, tz_arg)?;
             let resp = with_token(http, cfg, path, refresh_on_expired, |tok| {
-                plug.timer_list(tok, &sn, index)
+                plug.timer_list(tok, sn, index)
             })?;
             // The plug stores UTC times/weekday bits; present them in local
             // time with a Monday-first weekday mask.
@@ -653,10 +750,12 @@ fn do_timer(
             repeat,
             disabled,
         } => {
+            let sn = sn.as_deref().context("missing <SN>")?;
+            let time = time.as_deref().context("missing <TIME>")?;
             if action > 1 {
                 bail!("timer action must be 0 (off) or 1 (on)");
             }
-            let time = crate::support::parse_local_time(&time).ok_or_else(|| {
+            let time = crate::support::parse_local_time(time).ok_or_else(|| {
                 anyhow::anyhow!(
                     "invalid --time '{time}': use a local clock time like 19:25, or minutes of the day 0-1439 (e.g. 480 = 08:00)"
                 )
@@ -670,7 +769,7 @@ fn do_timer(
                 enabled: Some(if disabled { 0 } else { 1 }),
             };
             let resp = with_token(http, cfg, path, refresh_on_expired, |tok| {
-                plug.timer_add(tok, &sn, index, &timer)
+                plug.timer_add(tok, sn, index, &timer)
             })?;
             emit_json(json, &resp)?;
             if !json {
@@ -691,8 +790,10 @@ fn do_timer(
             Ok(())
         }
         TimerCmd::Remove { sn, id, index } => {
+            let sn = sn.as_deref().context("missing <SN>")?;
+            let id = id.context("missing <ID>")?;
             let resp = with_token(http, cfg, path, refresh_on_expired, |tok| {
-                plug.timer_list(tok, &sn, index)
+                plug.timer_list(tok, sn, index)
             })?;
             let found = resp.timer.into_iter().find(|t| t.timer_id == Some(id));
             match found {
@@ -700,7 +801,7 @@ fn do_timer(
                     with_token(http, cfg, path, refresh_on_expired, |tok| {
                         plug.timer_del(
                             tok,
-                            &sn,
+                            sn,
                             index,
                             id,
                             t.repeat.unwrap_or(0),
@@ -724,30 +825,38 @@ fn do_timer(
                 }
             }
         }
-        TimerCmd::Enable { sn, id, index } => set_timer_enabled(
-            http,
-            cfg,
-            path,
-            plug,
-            &sn,
-            index,
-            id,
-            true,
-            refresh_on_expired,
-            json,
-        ),
-        TimerCmd::Disable { sn, id, index } => set_timer_enabled(
-            http,
-            cfg,
-            path,
-            plug,
-            &sn,
-            index,
-            id,
-            false,
-            refresh_on_expired,
-            json,
-        ),
+        TimerCmd::Enable { sn, id, index } => {
+            let sn = sn.as_deref().context("missing <SN>")?;
+            let id = id.context("missing <ID>")?;
+            set_timer_enabled(
+                http,
+                cfg,
+                path,
+                plug,
+                sn,
+                index,
+                id,
+                true,
+                refresh_on_expired,
+                json,
+            )
+        }
+        TimerCmd::Disable { sn, id, index } => {
+            let sn = sn.as_deref().context("missing <SN>")?;
+            let id = id.context("missing <ID>")?;
+            set_timer_enabled(
+                http,
+                cfg,
+                path,
+                plug,
+                sn,
+                index,
+                id,
+                false,
+                refresh_on_expired,
+                json,
+            )
+        }
     }
 }
 
@@ -815,8 +924,9 @@ fn do_countdown(
 ) -> Result<()> {
     match sub {
         CountdownCmd::Status { sn, index } => {
+            let sn = sn.as_deref().context("missing <SN>")?;
             let resp = with_token(http, cfg, path, refresh_on_expired, |tok| {
-                plug.cntdown_get(tok, &sn, index)
+                plug.cntdown_get(tok, sn, index)
             })?;
             emit_json(json, &resp)?;
             if !json {
@@ -837,6 +947,8 @@ fn do_countdown(
             count,
             action,
         } => {
+            let sn = sn.as_deref().context("missing <SN>")?;
+            let count = count.context("missing <COUNT>")?;
             if action > 1 {
                 bail!("countdown action must be 0 (off) or 1 (on)");
             }
@@ -844,7 +956,7 @@ fn do_countdown(
                 bail!("countdown count must be > 0 seconds");
             }
             with_token(http, cfg, path, refresh_on_expired, |tok| {
-                plug.cntdown_start(tok, &sn, index, action, count)
+                plug.cntdown_start(tok, sn, index, action, count)
             })?;
             if !json {
                 println!(
@@ -855,8 +967,9 @@ fn do_countdown(
             Ok(())
         }
         CountdownCmd::Stop { sn, index } => {
+            let sn = sn.as_deref().context("missing <SN>")?;
             with_token(http, cfg, path, refresh_on_expired, |tok| {
-                plug.cntdown_stop(tok, &sn, index)
+                plug.cntdown_stop(tok, sn, index)
             })?;
             if !json {
                 println!("sn={sn} index={index} countdown stopped");

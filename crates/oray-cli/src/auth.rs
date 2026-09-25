@@ -7,27 +7,21 @@ use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use oray_core::auth::{AuthApi, LoginOutcome};
 use reqwest::blocking::Client as HttpClient;
-use std::io::IsTerminal;
 use std::path::PathBuf;
 
 #[derive(Subcommand)]
 pub enum AuthCmd {
-    /// Interactive sign-in: choose a login method and type the parameters
-    ///
-    /// This is the only command that prompts. `login`/`login-sms` keep their
-    /// required arguments and fail when one is missing.
-    Interactive,
     /// Log in with an Oray account (a fresh device may prompt for an SMS code)
     Login {
         /// Oray account (mobile number or email)
-        account: String,
+        account: Option<String>,
         /// Account password (stored locally as md5)
-        password: String,
+        password: Option<String>,
     },
     /// Log in with an SMS code instead of a password (`auth login-sms`)
     LoginSms {
         /// Mobile number bound to the account; it receives the login code
-        mobile: String,
+        mobile: Option<String>,
         /// Use a code you already received (e.g. from the official app):
         /// skips the captcha step and the SMS request
         #[arg(long)]
@@ -48,6 +42,57 @@ pub enum AuthCmd {
     Logout,
 }
 
+/// `--interactive`: type the arguments the command line left out.
+///
+/// Without the flag clap rejects a missing argument before this runs, so
+/// every `None` below is one the user explicitly asked to be prompted for.
+/// The login method is never a choice here — it is the subcommand itself
+/// (`login` = account + password, `login-sms` = mobile number).
+pub fn fill(cmd: &mut AuthCmd, cfg: &Config) -> Result<()> {
+    match cmd {
+        AuthCmd::Login { account, password } => {
+            prompt::require_terminal(
+                &[
+                    ("<ACCOUNT>", account.is_none()),
+                    ("<PASSWORD>", password.is_none()),
+                ],
+                "oray-tools auth login <account> <password>",
+            )?;
+            prompt::fill_str(
+                account,
+                "Account (mobile or email)",
+                saved_account(cfg).as_deref(),
+            )?;
+            if password.is_none() {
+                // Read without echoing: `ask_stdin` would print it back.
+                *password = Some(prompt::ask_secret("Password")?);
+            }
+            Ok(())
+        }
+        AuthCmd::LoginSms { mobile, .. } => {
+            prompt::require_terminal(
+                &[("<MOBILE>", mobile.is_none())],
+                "oray-tools auth login-sms <mobile>",
+            )?;
+            prompt::fill_checked(
+                mobile,
+                "Mobile number",
+                saved_account(cfg)
+                    .filter(|a| check_mobile(a).is_ok())
+                    .as_deref(),
+                check_mobile,
+            )
+        }
+        // Nothing to complete: no arguments at all.
+        AuthCmd::Refresh | AuthCmd::Status | AuthCmd::Logout => Ok(()),
+    }
+}
+
+/// The account stored by an earlier login, offered as a prompt default.
+fn saved_account(cfg: &Config) -> Option<String> {
+    cfg.account.as_ref().map(|a| a.account.clone())
+}
+
 pub fn run(
     http: &HttpClient,
     cfg: &mut Config,
@@ -57,123 +102,36 @@ pub fn run(
     json: bool,
 ) -> Result<()> {
     match sub {
-        // Interactive prompting is opt-in: only this subcommand asks.
-        AuthCmd::Interactive => interactive(http, cfg, path, clientid, json),
         AuthCmd::Login { account, password } => {
-            do_login(http, cfg, path, clientid, &account, &password, json)
+            let account = account.as_deref().context("missing <ACCOUNT>")?;
+            let password = password.as_deref().context("missing <PASSWORD>")?;
+            do_login(http, cfg, path, clientid, account, password, json)
         }
         AuthCmd::LoginSms {
             mobile,
             code,
             captcha,
             no_browser,
-        } => do_login_sms(
-            http,
-            cfg,
-            path,
-            clientid,
-            &mobile,
-            SmsLoginOpts {
-                code: code.as_deref(),
-                captcha: captcha.as_deref(),
-                no_browser,
-            },
-            json,
-        ),
-        AuthCmd::Refresh => do_refresh(http, cfg, path, clientid, json),
-        AuthCmd::Status => do_status(cfg, json),
-        AuthCmd::Logout => do_logout(cfg, path, json),
-    }
-}
-
-/// Interactive session behind `oray-tools auth interactive`: pick a login
-/// method, then enter the parameters it needs. The protocol layer is
-/// untouched by this — it only receives the finished values.
-fn interactive(
-    http: &HttpClient,
-    cfg: &mut Config,
-    path: &PathBuf,
-    clientid: Option<&str>,
-    json: bool,
-) -> Result<()> {
-    if !std::io::stdin().is_terminal() {
-        bail!(
-            "the interactive session needs a terminal; run a concrete command instead, \
-             e.g. `oray-tools auth login <account> <password>` or \
-             `oray-tools auth login-sms <mobile>`"
-        );
-    }
-    // The stdin lock is held only for the menu: `Stdin::lock` is not
-    // reentrant, and the helpers below read stdin themselves.
-    eprintln!("oray-tools: interactive sign-in");
-    let method = {
-        let stdin = std::io::stdin();
-        let mut input = stdin.lock();
-        prompt::choose_from(
-            &mut input,
-            &mut std::io::stderr(),
-            "Login method",
-            &[
-                "password (account + password)",
-                "SMS code (mobile, no password)",
-                "quit",
-            ],
-        )?
-    };
-    match method {
-        0 => {
-            let (account, password) = ask_password_login(cfg)?;
-            do_login(http, cfg, path, clientid, &account, &password, json)
-        }
-        1 => {
-            let mobile = ask_mobile(cfg)?;
+        } => {
+            let mobile = mobile.as_deref().context("missing <MOBILE>")?;
             do_login_sms(
                 http,
                 cfg,
                 path,
                 clientid,
-                &mobile,
-                SmsLoginOpts::default(),
+                mobile,
+                SmsLoginOpts {
+                    code: code.as_deref(),
+                    captcha: captcha.as_deref(),
+                    no_browser,
+                },
                 json,
             )
         }
-        _ => {
-            eprintln!("cancelled");
-            Ok(())
-        }
+        AuthCmd::Refresh => do_refresh(http, cfg, path, clientid, json),
+        AuthCmd::Status => do_status(cfg, json),
+        AuthCmd::Logout => do_logout(cfg, path, json),
     }
-}
-
-/// Collect the account/password pair. The password comes back from a
-/// no-echo prompt.
-fn ask_password_login(cfg: &Config) -> Result<(String, String)> {
-    let saved = cfg.account.as_ref().map(|a| a.account.clone());
-    let account = prompt::ask(
-        &mut std::io::stdin().lock(),
-        &mut std::io::stderr(),
-        "Account (mobile or email)",
-        saved.as_deref(),
-    )?;
-    let password = prompt::ask_secret("Password")?;
-    Ok((account, password))
-}
-
-/// Collect the mobile number for the SMS flow, offering the saved account
-/// when it is a plausible mobile number.
-fn ask_mobile(cfg: &Config) -> Result<String> {
-    let saved = cfg
-        .account
-        .as_ref()
-        .map(|a| a.account.clone())
-        .filter(|a| check_mobile(a).is_ok());
-    let mobile = prompt::ask(
-        &mut std::io::stdin().lock(),
-        &mut std::io::stderr(),
-        "Mobile number",
-        saved.as_deref(),
-    )?;
-    check_mobile(&mobile)?;
-    Ok(mobile)
 }
 
 /// `123****8901` — recognizable, but not usable to harvest the number.

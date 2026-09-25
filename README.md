@@ -6,11 +6,13 @@ every device list/info/status is fetched live from the cloud on each command.
 
 ## Features
 
-- `auth interactive` — **显式**交互式登录: choose the login method (password /
-  SMS code) and type the parameters; prompting exists only behind this
-  subcommand. `auth login <account> <password>` stays argument-driven and
-  also handles the SMS-verification flow used when registering a new trusted
-  device
+- `--interactive` — **显式**交互补全: prompt for the arguments the command
+  line leaves out (hidden-echo password, saved account as the default, values
+  validated while typing). It works in every group — `auth`, `wakeup`,
+  `remote`, `wakeup plug timer/countdown` — and only ever behind this flag:
+  without it a missing argument keeps clap's native error. `auth login
+  <account> <password>` stays argument-driven and also handles the
+  SMS-verification flow used when registering a new trusted device
 - `auth login-sms <mobile>` — passwordless login with an SMS code
   (**手机验证码**): opens a browser for the slider captcha, requests the code
   and exchanges it for tokens (see [SMS login](#sms-login))
@@ -144,7 +146,7 @@ latest `.deb`/`.exe` while history lives in GitHub Releases.
 Authentication (stored locally):
 
 ```
-oray-tools auth interactive                   # interactive: choose a method, type the parameters
+oray-tools auth login --interactive          # prompt for the arguments left out
 oray-tools auth login <account> <password>   # first run on a device may prompt for an SMS code
 oray-tools auth login-sms <mobile>           # passwordless: captcha in the browser + SMS code
 oray-tools auth refresh                      # renew tokens
@@ -152,33 +154,41 @@ oray-tools auth status                       # show token info and expiry (--jso
 oray-tools auth logout                       # clear saved tokens and account
 ```
 
-### Interactive sign-in
+### Interactive completion (`--interactive`)
 
-Prompting is opt-in: it exists only behind `oray-tools auth interactive`.
-Pick a login method, then answer the prompts — the saved account is offered
-as the default and the password is read without echoing it:
+Prompting is opt-in and explicit: add `--interactive` — anywhere on the
+command line, in any command group — and every argument that is still
+missing is asked for. Values already given are never asked again, so
+`oray-tools auth login alice --interactive` asks only for the password.
+The login method itself is never a choice: it is the subcommand
+(`login` = account + password, `login-sms` = mobile number).
 
 ```
-$ oray-tools auth interactive
-oray-tools: interactive sign-in
-Login method:
-  1) password (account + password)
-  2) SMS code (mobile, no password)
-  3) quit
-Choose 1-3: 1
+$ oray-tools auth login --interactive
 Account (mobile or email) [alice@example.com]:
 Password:
+$ oray-tools wakeup rename --interactive
+Device serial number (SN): SN1234567
+New device name: bedroom plug
+$ oray-tools remote rename --interactive
+Remote id: 42
+New device name: office pc
 ```
 
-- `auth login <account> <password>` and `auth login-sms <mobile>` never ask:
-  their arguments are required, and a missing one is the usual
-  `error: the following required arguments were not provided: <PASSWORD>`.
-  A bare `oray-tools auth` fails like the other subcommand groups
-  (`wakeup`, `remote`): usage help and exit code 2.
+- Without the flag nothing ever asks: a missing argument is still clap's
+  native `error: the following required arguments were not provided:
+  <PASSWORD>` (exit 2), `--help` still documents `<ACCOUNT> <PASSWORD>` as
+  required, and a bare `oray-tools auth` fails like the other subcommand
+  groups (`wakeup`, `remote`): usage help and exit code 2.
+- Values are checked while typing — a bad `--time`, an implausible mobile
+  number or a non-numeric id is reported and asked for again.
+- The password is read without echoing; the saved account is offered as the
+  default for `login`, and for `login-sms` when it looks like a phone number.
 - Prompts go to **stderr**, so `--json` output on stdout stays
   machine-readable.
-- Without a terminal (a pipe, CI) `auth interactive` fails immediately
-  instead of hanging.
+- Without a terminal (a pipe, CI) `--interactive` fails immediately instead
+  of hanging, naming the missing arguments and the concrete command that
+  supplies them.
 
 The split is deliberate: every human interaction — prompts, the SMS-code
 question, the slider captcha — lives in `oray-cli` (`prompt.rs`,

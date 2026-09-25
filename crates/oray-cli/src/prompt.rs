@@ -1,18 +1,21 @@
 //! Interactive terminal input — the "human in the loop" half of the CLI.
 //!
-//! Everything a person has to *do* lives here: choosing a login method,
-//! typing an account, a password or a code. The protocol layer
-//! (`oray-core`) never reads stdin and never prints: it only exchanges data
-//! with the API endpoints (see `oray-core/tests/purity.rs`, which fails the
-//! build if that ever stops being true).
+//! Everything a person has to *do* lives here: typing the argument the
+//! command line left out (only when `--interactive` asked for it), a
+//! password or a code. The protocol layer (`oray-core`) never reads stdin
+//! and never prints: it only exchanges data with the API endpoints (see
+//! `oray-core/tests/purity.rs`, which fails the build if that ever stops
+//! being true).
 //!
 //! Prompts are written to **stderr** so that `--json` output on stdout stays
 //! machine-readable even when a command asks questions. The prompts take the
 //! input/output handles as arguments so the flows can be tested without a
-//! terminal; the interactive callers pass `stdin().lock()` and `stderr()`.
+//! terminal; the interactive callers go through [`ask_stdin`] / [`ask_secret`].
 
 use anyhow::{Result, bail};
-use std::io::{BufRead, Write};
+use std::fmt::Display;
+use std::io::{BufRead, IsTerminal, Write};
+use std::str::FromStr;
 
 /// Read one line, showing `label` (plus `default` in brackets) on `out`.
 ///
@@ -92,34 +95,103 @@ pub fn ask_secret(label: &str) -> Result<String> {
     Ok(line)
 }
 
-/// Present a numbered menu on `out` and return the chosen index (0-based).
+/// Fail when `--interactive` would have to prompt for an argument but stdin
+/// is not a terminal (a pipe or CI would hang otherwise).
 ///
-/// Anything that is not a number inside the menu is rejected with a hint and
-/// asked again; end of input is an error.
-pub fn choose_from<R: BufRead, W: Write>(
-    input: &mut R,
-    out: &mut W,
-    label: &str,
-    options: &[&str],
-) -> Result<usize> {
-    debug_assert!(!options.is_empty());
-    writeln!(out, "{label}:")?;
-    for (i, option) in options.iter().enumerate() {
-        writeln!(out, "  {}) {option}", i + 1)?;
+/// `args` lists every argument of the command as a `(name, is_missing)` pair
+/// so the error can name *all* the values that are still missing, together
+/// with the concrete command that supplies them — nothing has to be guessed.
+/// When nothing is missing this is a no-op and stdin is never touched.
+pub fn require_terminal(args: &[(&str, bool)], example: &str) -> Result<()> {
+    let missing: Vec<&str> = args
+        .iter()
+        .filter(|(_, is_missing)| *is_missing)
+        .map(|(name, _)| *name)
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "`--interactive` needs an interactive terminal, but stdin is not one; missing {} — \
+             pass the value{} directly instead, e.g. `{example}`",
+            missing.join(" "),
+            if missing.len() == 1 { "" } else { "s" }
+        );
+    }
+    Ok(())
+}
+
+/// [`ask`] against the process's own stdin/stderr for a single value.
+///
+/// The stdin lock is taken and released inside the call, so [`ask_secret`]
+/// (which reads stdin itself) never runs while it is held — `Stdin::lock` is
+/// not reentrant.
+pub fn ask_stdin(label: &str, default: Option<&str>) -> Result<String> {
+    ask(
+        &mut std::io::stdin().lock(),
+        &mut std::io::stderr(),
+        label,
+        default,
+    )
+}
+
+/// Fill `slot` with [`ask_stdin`] when the command line left it empty.
+///
+/// Callers run [`require_terminal`] for the whole command first, so this
+/// only ever prompts on a real terminal.
+pub fn fill_str(slot: &mut Option<String>, label: &str, default: Option<&str>) -> Result<()> {
+    if slot.is_none() {
+        *slot = Some(ask_stdin(label, default)?);
+    }
+    Ok(())
+}
+
+/// Like [`fill_str`], but keeps asking until the line parses as `T`
+/// (a numeric argument: id, count, ...).
+pub fn fill_parsed<T>(slot: &mut Option<T>, label: &str) -> Result<()>
+where
+    T: FromStr,
+    T::Err: Display,
+{
+    if slot.is_some() {
+        return Ok(());
     }
     loop {
-        write!(out, "Choose 1-{}: ", options.len())?;
-        out.flush()?;
-        let mut line = String::new();
-        if input.read_line(&mut line)? == 0 {
-            bail!("no choice for `{label}` (stdin ended); pass the values as arguments instead");
+        let line = ask_stdin(label, None)?;
+        match line.parse::<T>() {
+            Ok(value) => {
+                *slot = Some(value);
+                return Ok(());
+            }
+            Err(e) => eprintln!("error: expected a number for `{label}`, got '{line}' ({e})"),
         }
-        if let Ok(n) = line.trim().parse::<usize>()
-            && (1..=options.len()).contains(&n)
-        {
-            return Ok(n - 1);
+    }
+}
+
+/// Like [`fill_str`], but keeps asking until `ok` accepts the line (an
+/// argument with a known format: mobile number, on/off, clock time, ...).
+pub fn fill_checked<F>(
+    slot: &mut Option<String>,
+    label: &str,
+    default: Option<&str>,
+    ok: F,
+) -> Result<()>
+where
+    F: Fn(&str) -> Result<()>,
+{
+    if slot.is_some() {
+        return Ok(());
+    }
+    loop {
+        let line = ask_stdin(label, default)?;
+        match ok(&line) {
+            Ok(()) => {
+                *slot = Some(line);
+                return Ok(());
+            }
+            Err(e) => eprintln!("error: {e}"),
         }
-        writeln!(out, "please enter a number between 1 and {}", options.len())?;
     }
 }
 
@@ -200,31 +272,8 @@ mod tests {
     }
 
     #[test]
-    fn choose_parses_a_valid_number() {
-        let mut input = Cursor::new("2\n");
-        let mut out = Vec::new();
-        let index =
-            choose_from(&mut input, &mut out, "Login method", &["password", "sms"]).unwrap();
-        assert_eq!(index, 1);
-        assert!(String::from_utf8(out).unwrap().contains("1) password"));
-    }
-
-    #[test]
-    fn choose_reasks_on_out_of_range_input() {
-        let mut input = Cursor::new("9\nx\n1\n");
-        let mut out = Vec::new();
-        let index =
-            choose_from(&mut input, &mut out, "Login method", &["password", "sms"]).unwrap();
-        assert_eq!(index, 0);
-        let text = String::from_utf8(out).unwrap();
-        assert_eq!(text.matches("between 1 and 2").count(), 2);
-    }
-
-    #[test]
-    fn choose_reports_end_of_input() {
-        let mut input = Cursor::new(String::new());
-        let mut out = Vec::new();
-        let err = choose_from(&mut input, &mut out, "Login method", &["password"]).unwrap_err();
-        assert!(err.to_string().contains("stdin ended"), "{err}");
+    fn require_terminal_nothing_missing_never_touches_stdin() {
+        // Nothing missing: never reads stdin, so it cannot block.
+        require_terminal(&[], "oray-tools wakeup info <sn>").unwrap();
     }
 }
