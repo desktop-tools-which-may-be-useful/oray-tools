@@ -33,7 +33,9 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy (deny warnings)
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Run tests
-        run: cargo test
+        # --workspace: Cargo.toml's default-members only list oray-cli, so a
+        # plain `cargo test` would silently skip oray-core and its purity guard
+        run: cargo test --workspace
