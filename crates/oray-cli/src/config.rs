@@ -75,19 +75,73 @@ impl Config {
         Ok((cfg, p))
     }
 
+    /// Persist the config atomically with owner-only permissions.
+    ///
+    /// The file carries credentials (`password_md5`, `refresh_token`), so it
+    /// is never written in place: the bytes go to a `0600` temporary file in
+    /// the same directory, which is then `rename`d over the target. The
+    /// rename is atomic, so a reader (or a process killed mid-save) sees
+    /// either the old file or the complete new one — never a truncated one —
+    /// and the mode of the temporary file becomes the mode of the config,
+    /// tightening an older world-readable file along the way. Any failure
+    /// removes the temporary file before the error propagates.
     pub fn save(&self, path: &PathBuf) -> Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)
                 .with_context(|| format!("create dir {}", dir.display()))?;
         }
         let raw = toml::to_string_pretty(self).context("serialize config")?;
-        std::fs::write(path, raw).with_context(|| format!("write config {}", path.display()))?;
-        Ok(())
+        let tmp = temp_path(path);
+        // A stale temporary file from a recycled pid could carry looser
+        // permissions than `mode` grants on an already existing file.
+        let _ = std::fs::remove_file(&tmp);
+        let saved = write_temp(&tmp, &raw).and_then(|()| {
+            std::fs::rename(&tmp, path)
+                .with_context(|| format!("replace config {}", path.display()))
+        });
+        if saved.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        saved
     }
 
     pub fn server(&self) -> Server {
         self.server.clone().unwrap_or_default().normalized()
     }
+}
+
+/// Sibling temporary file used by [`Config::save`]: the target name plus the
+/// pid, so concurrent writers cannot pick the same name.
+fn temp_path(path: &std::path::Path) -> PathBuf {
+    let mut name = match path.file_name() {
+        Some(n) => n.to_os_string(),
+        None => std::ffi::OsString::from("config.toml"),
+    };
+    name.push(format!(".{}.tmp", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// Write the serialized config to the temporary file, `0600` on Unix (the
+/// file holds credentials; a non-Unix build keeps the platform default).
+fn write_temp(tmp: &std::path::Path, raw: &str) -> Result<()> {
+    use std::io::Write as _;
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts
+        .open(tmp)
+        .with_context(|| format!("write config {}", tmp.display()))?;
+    file.write_all(raw.as_bytes())
+        .with_context(|| format!("write config {}", tmp.display()))?;
+    // Make the data durable before the rename publishes it.
+    file.sync_all()
+        .with_context(|| format!("write config {}", tmp.display()))?;
+    Ok(())
 }
 
 impl Default for Server {
@@ -185,5 +239,67 @@ slapi_base = "https://slapi.example.net"
         assert_eq!(s.api_base, "https://api.example.com");
         assert_eq!(s.slapi_base, DEFAULT_SLAPI_BASE);
         assert_eq!(s.shield_base, "https://shield.example.com");
+    }
+
+    /// The config holds credentials: `save` must create it `0600` (not the
+    /// `0644` a plain write would get under umask 022), the bytes must load
+    /// back through `Config::load`, a second save must replace the existing
+    /// file (the `rename` path), and no temporary file may be left behind.
+    #[cfg(unix)]
+    #[test]
+    fn save_is_private_reloadable_and_replaces_atomically() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("oray-tools-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let _ = std::fs::remove_file(&path);
+
+        let cfg = Config {
+            account: Some(Account {
+                account: "demo".into(),
+                password_md5: "abc".into(),
+            }),
+            token: Some(Token {
+                access_token: "at".into(),
+                refresh_token: "rt".into(),
+                refresh_expires: 123,
+            }),
+            client: Some(Client {
+                clientid: "uuid".into(),
+            }),
+            ..Default::default()
+        };
+
+        cfg.save(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o600, "fresh config must be owner-only");
+
+        let (loaded, loaded_path) = Config::load(Some(&path)).unwrap();
+        assert_eq!(loaded_path, path);
+        assert_eq!(loaded.account.as_ref().unwrap().account, "demo");
+        assert_eq!(loaded.token.as_ref().unwrap().refresh_expires, 123);
+        assert_eq!(loaded.client.as_ref().unwrap().clientid, "uuid");
+
+        // Saving again replaces the old file through the rename path.
+        let mut second = cfg.clone();
+        second.token.as_mut().unwrap().refresh_expires = 456;
+        second.save(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o600, "overwritten config stays owner-only");
+        let (reloaded, _) = Config::load(Some(&path)).unwrap();
+        assert_eq!(reloaded.token.unwrap().refresh_expires, 456);
+
+        // The temporary file never survives a successful save.
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

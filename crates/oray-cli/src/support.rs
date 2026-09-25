@@ -36,8 +36,16 @@ pub fn raw_trace() -> bool {
 /// Truncate a body for display (mirrors the CLI's classic `--verbose` view).
 fn display_body(body: &str) -> String {
     let body = body.trim();
-    if body.len() > 4096 {
-        format!("{}…", &body[..4096])
+    if body.len() <= 4096 {
+        return body.to_string();
+    }
+    // Cut at a character boundary: slicing at the raw byte 4096 panics when
+    // a multi-byte character straddles it. `nth(4096)` is the byte offset of
+    // the first character beyond the 4096th; when the body holds fewer
+    // characters than that, there is nothing to cut and nothing to elide.
+    let cut = body.char_indices().nth(4096).map_or(body.len(), |(i, _)| i);
+    if cut < body.len() {
+        format!("{}…", &body[..cut])
     } else {
         body.to_string()
     }
@@ -401,11 +409,33 @@ pub fn resolve_tz(cfg: &Config, arg: Option<i64>) -> Result<i64> {
     Ok(min)
 }
 
-pub fn print_tokens(cfg: &Config) {
+/// Mask a token for display: keep the first 6 characters so the value stays
+/// recognizable (`abcdef***`); a token shorter than the prefix is masked in
+/// full.
+fn mask_token(token: &str) -> String {
+    if token.chars().count() >= 6 {
+        let prefix: String = token.chars().take(6).collect();
+        format!("{prefix}***")
+    } else {
+        "***".to_string()
+    }
+}
+
+/// Print the saved token state. Without `show` the tokens are masked
+/// (`abcdef***`) so a plain `auth status` cannot leak a usable credential;
+/// `auth status --show` prints them in full.
+pub fn print_tokens(cfg: &Config, show: bool) {
+    let display = |token: &str| {
+        if show {
+            token.to_string()
+        } else {
+            mask_token(token)
+        }
+    };
     match &cfg.token {
         Some(t) => {
-            println!("access_token:    {}", t.access_token);
-            println!("refresh_token:   {}", t.refresh_token);
+            println!("access_token:    {}", display(&t.access_token));
+            println!("refresh_token:   {}", display(&t.refresh_token));
             println!(
                 "access_expiry:   {}",
                 crate::token::access_expiry(&t.access_token)
@@ -521,17 +551,65 @@ mod tests {
     }
 
     #[test]
+    fn mask_token_keeps_prefix_and_hides_the_rest() {
+        assert_eq!(mask_token("abcdefghijklmnop"), "abcdef***");
+        assert_eq!(mask_token("abcdef"), "abcdef***"); // exactly the prefix
+        assert_eq!(mask_token("abcde"), "***"); // shorter: masked in full
+        assert_eq!(mask_token("abc"), "***");
+        assert_eq!(mask_token(""), "***");
+        // The mask never keeps more than 6 characters.
+        assert!(mask_token("abcdefghijklmnopqrstuvwxyz").len() <= 9);
+    }
+
+    /// A body made entirely of 3-byte characters crosses byte 4096 inside a
+    /// character: the old byte slice panicked there.
+    #[test]
+    fn display_body_truncates_multibyte_body_on_char_boundary() {
+        let body = "中".repeat(5000); // 15000 bytes, way past 4096
+        assert!(body.len() > 4096);
+        let out = display_body(&body);
+        let cut = out.strip_suffix('…').expect("expected an elided body");
+        assert_eq!(cut.chars().count(), 4096, "cut after 4096 characters");
+        assert!(body.starts_with(cut), "prefix of the original body");
+        // A cut on a character boundary is always valid UTF-8 (a String).
+        assert_eq!(cut.len(), 4096 * 3); // byte length of the kept prefix
+    }
+
+    /// A body longer than 4096 bytes but shorter than 4096 characters has
+    /// nothing to cut: it is shown as-is, without a spurious ellipsis.
+    #[test]
+    fn display_body_keeps_short_char_body_intact() {
+        let body = "汉".repeat(1400); // 4200 bytes, 1400 characters
+        assert!(body.len() > 4096);
+        assert_eq!(display_body(&body), body);
+    }
+
+    #[test]
+    fn display_body_leaves_small_and_ascii_bodies_alone() {
+        assert_eq!(display_body("  hello \n"), "hello");
+        assert_eq!(display_body(&"a".repeat(4096)), "a".repeat(4096));
+        assert_eq!(
+            display_body(&"a".repeat(4097)),
+            format!("{}…", "a".repeat(4096))
+        );
+    }
+
+    #[test]
     fn resolve_prefers_arg_over_config() {
-        let mut cfg = Config::default();
-        cfg.tz = Some("-05:00".to_string());
+        let cfg = Config {
+            tz: Some("-05:00".to_string()),
+            ..Default::default()
+        };
         assert_eq!(resolve_tz(&cfg, Some(480)).unwrap(), 480);
         assert_eq!(resolve_tz(&cfg, None).unwrap(), -300);
     }
 
     #[test]
     fn resolve_invalid_config_tz_errors() {
-        let mut cfg = Config::default();
-        cfg.tz = Some("bogus".to_string());
+        let cfg = Config {
+            tz: Some("bogus".to_string()),
+            ..Default::default()
+        };
         assert!(resolve_tz(&cfg, None).is_err());
     }
 
