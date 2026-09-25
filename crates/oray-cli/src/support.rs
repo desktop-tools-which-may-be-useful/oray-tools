@@ -183,9 +183,22 @@ pub fn parse_on_off(state: &str) -> Result<bool> {
 
 /// Seconds for an "ago" bound like `30s`, `5m`, `2h`, `1d`; `None` when the
 /// string is not a plain duration (e.g. an absolute date/time instead).
+///
+/// Total on every input, because the value comes straight from the user:
+/// `--since`/`--until` are arbitrary strings, so this must never panic.
+///
+/// * Non-ASCII input is rejected *before* the byte split below — `split_at`
+///   slices at a byte index and panics when the last character is multi-byte
+///   (`--since '3天'` used to abort with "not a char boundary"). A valid
+///   bound can only end in an ASCII unit letter, so anything else is not a
+///   duration anyway.
+/// * The unit conversions use `checked_mul`: a long digit string
+///   (`--since '9999999999999999h'`) overflowed (a panic in debug builds, a
+///   silently wrapped, wrong time window in release builds). An overflow now
+///   falls through to the caller's `invalid time bound` error.
 pub fn parse_ago_secs(s: &str) -> Option<i64> {
     let s = s.trim();
-    if s.len() < 2 {
+    if s.len() < 2 || !s.is_ascii() {
         return None;
     }
     let (num, unit) = s.split_at(s.len() - 1);
@@ -195,9 +208,9 @@ pub fn parse_ago_secs(s: &str) -> Option<i64> {
     let n: i64 = num.parse().ok()?;
     match unit {
         "s" => Some(n),
-        "m" => Some(n * 60),
-        "h" => Some(n * 3600),
-        "d" => Some(n * 86400),
+        "m" => n.checked_mul(60),
+        "h" => n.checked_mul(3600),
+        "d" => n.checked_mul(86400),
         _ => None,
     }
 }
@@ -623,6 +636,44 @@ mod tests {
         assert_eq!(parse_ago_secs("1x"), None);
         assert_eq!(parse_ago_secs("2026-09-01"), None);
         assert_eq!(parse_ago_secs("0"), None);
+    }
+
+    /// User input is arbitrary text: a multi-byte last character must be
+    /// rejected, not panic on the byte split (`--since '3天'` used to abort
+    /// with "end byte index 3 is not a char boundary", exit 101).
+    #[test]
+    fn ago_bounds_reject_non_ascii_instead_of_panicking() {
+        assert_eq!(parse_ago_secs("3天"), None);
+        assert_eq!(parse_ago_secs("中文"), None);
+        assert_eq!(parse_ago_secs("3d中文"), None);
+        // … and the bound resolver turns the rejection into its normal error
+        // instead of a panic.
+        let err = resolve_time_bound_tz("3天", true, 1_800_000_000, None).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid time bound '3天'"),
+            "{err}"
+        );
+    }
+
+    /// A digit string whose unit conversion exceeds `i64` must be rejected
+    /// (a panic in debug builds, a silently wrapped window in release).
+    #[test]
+    fn ago_bounds_reject_overflowing_durations() {
+        assert_eq!(parse_ago_secs("9999999999999999h"), None);
+        // 9999999999999999 * 60 still fits an i64, so the `m` case needs a
+        // longer digit string to actually overflow.
+        assert_eq!(parse_ago_secs("999999999999999999m"), None);
+        assert_eq!(parse_ago_secs("9999999999999999d"), None);
+        // More digits than fit in an i64 at all.
+        assert_eq!(parse_ago_secs("99999999999999999999999h"), None);
+        // Just below the overflow boundary still converts.
+        assert_eq!(
+            parse_ago_secs("2562047788015215h"),
+            Some(2562047788015215_i64 * 3600)
+        );
+        let err =
+            resolve_time_bound_tz("9999999999999999h", true, 1_800_000_000, None).unwrap_err();
+        assert!(err.to_string().contains("invalid time bound"), "{err}");
     }
 
     #[test]

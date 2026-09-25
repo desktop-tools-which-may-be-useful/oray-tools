@@ -30,8 +30,9 @@ every device list/info/status is fetched live from the cloud on each command.
 - `remote` — **远程设备** (PCs / phones), from `/remotes`:
   - `list`, `info <id>`, `status <id>`, `rename`, `memo`
 - Machine-readable output: every command accepts `--json` — exactly one JSON
-  value on stdout when it succeeds, `error: ...` on stderr (exit code 1) when
-  it fails (see [Machine-readable output](#machine-readable-output---json))
+  value on stdout when it succeeds, exactly one
+  `{"ok": false, "error": "..."}` object on stdout (exit code 1) when it
+  fails (see [Machine-readable output](#machine-readable-output---json))
 - Debug output: every command accepts `--verbose` (full request/response
   detail on stderr: method, URL, headers, request/response body). Sensitive
   values are masked by default; add `--trace-raw` to `--verbose` to see them
@@ -165,6 +166,12 @@ oray-tools auth status --show                # the same, printing the tokens in 
 oray-tools auth logout                       # clear saved tokens and account
 ```
 
+> **Security note on `auth login <account> <password>`:** a password passed
+> as a command-line argument is visible to other local processes (`ps`,
+> `/proc/*/cmdline`) and is kept in your shell history. Prefer
+> `oray-tools auth login --interactive`, which reads the password without
+> echoing it (`oray-tools auth login --help` repeats this warning).
+
 ### Interactive completion (`--interactive`)
 
 Prompting is opt-in and explicit: add `--interactive` — anywhere on the
@@ -285,8 +292,10 @@ oray-tools remote info <id>                  # extended detail
 oray-tools remote status <id>                # online state / last seen
 oray-tools remote rename <id> <new-name>     # rename (keeps the memo)
 oray-tools remote memo <id> <text>           # set the memo (keeps the name)
-# `remote status|rename|memo` resolve the id against the account's device
-# list; a miss reports `remote <id> not found among N remotes listed`.
+# `remote status|rename|memo` fetch the single remote directly
+# (`GET /console/remotes/<id>`); they no longer download the whole device
+# list to resolve one id. A miss reports the endpoint's own HTTP error,
+# e.g. `get remote detail failed (HTTP 404): ...`.
 ```
 
 Every command accepts `--json` for machine-readable output and `--verbose`
@@ -324,10 +333,16 @@ The contract, identical in every command group:
 - On success stdout carries **exactly one** JSON value — one object (or the
   arrays listed below) — and nothing else: human text, prompts and
   `--verbose`/`--trace-raw` traces all go to stderr.
-- On failure the behaviour is the same with and without `--json`: a single
-  `error: ...` line on **stderr** and exit code 1. No branch swallows an
-  error just because `--json` was passed, and no success prints an empty
-  stdout.
+- On failure the exit code is 1 in both modes, and the message text is the
+  same, but the channel differs by design: with `--json`, stdout carries
+  exactly one object `{"ok": false, "error": "<message>"}` and the
+  `error: ...` line is *not* also written to stderr — a consumer parsing
+  stdout always finds exactly one value (success object or error object)
+  instead of an empty stdout plus prose on stderr. Without `--json` the
+  behaviour is unchanged: a single `error: ...` line on **stderr**. (Other
+  diagnostics — prompts, `--verbose` traces, warnings — stay on stderr in
+  both modes.) No branch swallows an error just because `--json` was
+  passed, and no success prints an empty stdout.
 - Mutating commands answer with `{"ok": true, ...}` plus the target
   (`sn` or `id` and the fields of the change): `wakeup rename|memo`,
   `wakeup plug on|off` (`status`), `wakeup plug led` (`led`),

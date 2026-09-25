@@ -50,8 +50,11 @@ impl Error {
     /// * the XML fragment `<code>1010</code>`,
     /// * [`oray_xml_error`]'s rendering `Oray API error 1010: ...`,
     /// * JSON `"code":1010` / `"code": 1010`,
-    /// * `code=1010`, whose digits must end on a non-alphanumeric boundary
-    ///   (so `code=10100` and `sn=101000000001` do not match).
+    /// * `code=1010`, whose digits must start on a boundary too: the
+    ///   character before `code` has to be a non-alphanumeric (or the
+    ///   marker the start of the message), and the digits must end on a
+    ///   non-alphanumeric one — so `{"errorCode":1010}`, `devicecode=1010`,
+    ///   `code=10100` and `sn=101000000001` do not match.
     pub fn from_message(desc: String) -> Self {
         if is_token_expired_message(&desc) {
             Error::TokenExpired(desc)
@@ -85,7 +88,8 @@ fn is_token_expired_message(desc: &str) -> bool {
     if lower.contains("<code>1010</code>") {
         return true;
     }
-    // Markers that must be followed by the digits `1010` on a proper
+    // Markers that must stand on a proper left boundary (not the tail of a
+    // longer key) and be followed by the digits `1010` on a proper right
     // boundary: JSON `"code":1010` (`"code": 1010`), the `code=1010` query
     // style, and `oray_xml_error`'s `Oray API error 1010: ...` rendering.
     ["code=", "code\":", "oray api error "]
@@ -93,14 +97,26 @@ fn is_token_expired_message(desc: &str) -> bool {
         .any(|marker| marker_is_1010(&lower, marker))
 }
 
-/// True when `lower` contains `marker` followed by optional whitespace, the
-/// exact digits `1010`, and then a non-alphanumeric boundary — so `code=1010`
-/// and `Oray API error 1010: x` match while `code=10100` and
-/// `Oray API error 10100: x` do not.
+/// True when `lower` contains `marker` on a proper **left** boundary
+/// (start of the message, or preceded by a non-alphanumeric character) and
+/// then optional whitespace, the exact digits `1010`, and a non-alphanumeric
+/// right boundary — so `{"code":1010}`, `code=1010` and
+/// `Oray API error 1010: x` match while `{"errorCode":1010}`,
+/// `devicecode=1010`, `code=10100` and `Oray API error 10100: x` do not.
+///
+/// The left check matters because the markers are *suffixes* of longer keys:
+/// without it any field merely ending in `code` (`errorCode`, `devicecode`)
+/// matched and sent callers into the pointless refresh/retry this matcher
+/// exists to avoid.
 fn marker_is_1010(lower: &str, marker: &str) -> bool {
-    let mut search = lower;
-    while let Some(pos) = search.find(marker) {
-        let after = &search[pos + marker.len()..];
+    let mut from = 0usize;
+    while let Some(rel) = lower[from..].find(marker) {
+        let pos = from + rel;
+        let left_ok = lower[..pos]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric());
+        let after = &lower[pos + marker.len()..];
         let rest = after.trim_start();
         let digits_end = rest
             .find(|c: char| !c.is_ascii_digit())
@@ -109,10 +125,12 @@ fn marker_is_1010(lower: &str, marker: &str) -> bool {
             .chars()
             .next()
             .is_some_and(|c| c.is_alphanumeric());
-        if &rest[..digits_end] == "1010" && !next_is_word {
+        if left_ok && &rest[..digits_end] == "1010" && !next_is_word {
             return true;
         }
-        search = after;
+        // Continue after this occurrence: an embedded (non-boundary) hit
+        // must not hide a later one that is on a boundary.
+        from = pos + marker.len();
     }
     false
 }
@@ -186,6 +204,11 @@ mod tests {
             "Oray API error 10100: device offline",
             "order 1010 rejected",
             "remote 101000000001 is offline",
+            // Keys that merely *end* in `code`: the marker without a left
+            // boundary classified both as TokenExpired and sent callers into
+            // a pointless refresh/retry.
+            r#"{"errorCode":1010}"#,
+            "devicecode=1010",
         ] {
             assert!(
                 matches!(Error::from_message(desc.to_string()), Error::Api(_)),

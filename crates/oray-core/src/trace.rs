@@ -97,15 +97,29 @@ impl TracedError {
     /// Two shapes count as expired:
     ///
     /// * [`Error::TokenExpired`] — the body said so (`code 1010` /
-    ///   `TOKEN_EXPIRED`), and
-    /// * `401 Unauthorized` — some endpoints express expiry as a bare status
-    ///   with no recognizable body. `403 Forbidden` deliberately does *not*
-    ///   count: that is a permission problem a token refresh cannot fix.
+    ///   `TOKEN_EXPIRED`), unconditionally, and
+    /// * `401 Unauthorized` — but only when the request that produced it
+    ///   actually carried an `Authorization` header (checked against
+    ///   [`RequestLog::request_headers`] of the failing call). A 401 from a
+    ///   request that never presented a token cannot be fixed by refreshing:
+    ///   around `AuthApi::login` / `login_with_code` it means bad
+    ///   credentials, and treating it as expiry would trigger a doomed
+    ///   refresh+retry. Some endpoints express expiry as a bare status with
+    ///   no recognizable body, so a 401 *with* a token still counts.
+    ///   `403 Forbidden` deliberately does not count either way: that is a
+    ///   permission problem a token refresh cannot fix.
     pub fn is_token_expired(&self) -> bool {
-        matches!(
-            &self.error,
-            Error::TokenExpired(_) | Error::HttpStatus { status: 401, .. }
-        )
+        match &self.error {
+            Error::TokenExpired(_) => true,
+            Error::HttpStatus { status: 401, .. } => self.calls.iter().any(|call| {
+                call.status == Some(401)
+                    && call
+                        .request_headers
+                        .iter()
+                        .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            }),
+            _ => false,
+        }
     }
 }
 
@@ -440,25 +454,76 @@ mod tests {
         assert!(mask_authorization("Bearer abcdef012345").ends_with("***"));
     }
 
-    /// Servers that signal expiry with a bare `401` (no recognizable body)
-    /// must still trigger the refresh-and-retry path; `403` must not.
-    #[test]
-    fn token_expired_by_status_401_only() {
-        let http = |status: u16| TracedError {
+    /// Build a status error carrying the request log that produced it, with
+    /// or without an `Authorization` header (the rule `is_token_expired`
+    /// applies: a 401 only counts as expiry when a token was presented).
+    fn status_error(status: u16, with_auth: bool) -> TracedError {
+        let request_headers = if with_auth {
+            vec![("Authorization".into(), "Bearer tok".into())]
+        } else {
+            Vec::new()
+        };
+        TracedError {
             error: Error::HttpStatus {
                 what: "list remotes",
                 status,
                 body: "unauthorized".into(),
             },
-            calls: Vec::new(),
-        };
-        assert!(http(401).is_token_expired());
-        assert!(!http(403).is_token_expired());
-        assert!(!http(404).is_token_expired());
+            calls: vec![RequestLog {
+                method: "GET".into(),
+                url: "https://api.example/x".into(),
+                request_headers,
+                request_body: None,
+                status: Some(status),
+                response_body: "unauthorized".into(),
+            }],
+        }
+    }
+
+    /// Servers that signal expiry with a bare `401` (no recognizable body)
+    /// must still trigger the refresh-and-retry path — but only when the
+    /// failing request presented a token; `403` must not, with or without
+    /// one.
+    #[test]
+    fn token_expired_by_status_401_only() {
+        assert!(status_error(401, true).is_token_expired());
+        assert!(!status_error(403, true).is_token_expired());
+        assert!(!status_error(404, true).is_token_expired());
         assert!(TracedError::from(Error::TokenExpired("TOKEN_EXPIRED".into())).is_token_expired());
         assert!(
             !TracedError::from(Error::Api("sn=101000000001 not found".into())).is_token_expired()
         );
+    }
+
+    /// A 401 from a request that never carried an `Authorization` header
+    /// (the login/signup endpoints) is a credentials failure, not a token
+    /// expiry: refreshing and retrying would be doomed, so the predicate has
+    /// to stay false — this is the shape `AuthApi::login` produces.
+    #[test]
+    fn status_401_without_authorization_is_not_expiry() {
+        assert!(!status_error(401, false).is_token_expired());
+        // The same status with a token still counts (expiry by bare status).
+        assert!(status_error(401, true).is_token_expired());
+        // A hand-built error with no request log at all cannot prove a token
+        // was presented, so it does not count either.
+        let logless = TracedError {
+            error: Error::HttpStatus {
+                what: "login",
+                status: 401,
+                body: "bad credentials".into(),
+            },
+            calls: Vec::new(),
+        };
+        assert!(!logless.is_token_expired());
+    }
+
+    /// `Error::TokenExpired` counts unconditionally (the body said so), no
+    /// request log required.
+    #[test]
+    fn token_expired_body_counts_without_any_call() {
+        let err = TracedError::from(Error::TokenExpired("TOKEN_EXPIRED".into()));
+        assert!(err.calls.is_empty());
+        assert!(err.is_token_expired());
     }
 
     fn exchange(status: u16, text: &str) -> Exchange {

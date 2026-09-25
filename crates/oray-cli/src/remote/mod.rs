@@ -5,14 +5,17 @@
 //!
 //! # `--json` output contract
 //!
-//! - With `--json`, every command prints **exactly one** JSON value on stdout
-//!   and only when it succeeds: an object (`rename`, `memo`) or one of the
-//!   shapes that already existed and stay untouched (`list`, `info`,
-//!   `status`).
-//! - A failure always `bail!`s: main.rs prints `error: ...` on stderr and
-//!   exits 1, identically in JSON and text mode. No branch swallows an error
-//!   just because `--json` was passed, and no success path prints an empty
-//!   stdout in JSON mode.
+//! - With `--json`, every command prints **exactly one** JSON value on
+//!   stdout: on success an object (`rename`, `memo`) or one of the shapes
+//!   that already existed and stay untouched (`list`, `info`, `status`);
+//!   on failure exactly one error object (next bullet).
+//! - A failure always `bail!`s: with `--json`, main.rs prints
+//!   `{"ok": false, "error": "<message>"}` on **stdout** — one object
+//!   carrying the very message the text mode prints — and exits 1, so a
+//!   consumer parsing stdout always sees exactly one value; without
+//!   `--json` the single `error: ...` line goes to stderr, byte-identical
+//!   to before. No branch swallows an error just because `--json` was
+//!   passed, and no success path prints an empty stdout in JSON mode.
 //! - Text-mode output is unchanged.
 
 use crate::config::Config;
@@ -66,7 +69,14 @@ fn json_memo(id: u64, memo: &str) -> serde_json::Value {
 }
 
 /// `--interactive`: type the arguments this command line left out.
-pub fn fill(cmd: &mut RemoteCmd) -> Result<()> {
+///
+/// A no-op unless the flag is set (defense in depth on top of clap's strict
+/// build in main.rs): prompting must be unreachable without
+/// `--interactive`, whatever `strictify` marks as required.
+pub fn fill(cmd: &mut RemoteCmd, interactive: bool) -> Result<()> {
+    if !interactive {
+        return Ok(());
+    }
     match cmd {
         RemoteCmd::List => Ok(()),
         RemoteCmd::Info { id } => {
@@ -172,7 +182,12 @@ pub fn run(
         }
         RemoteCmd::Status { id } => {
             let id = id.context("missing <ID>")?;
-            let remote = with_token(http, cfg, path, refresh_on_expired, |tok| api.find(tok, id))?;
+            // Single-item console lookup, not a list+scan: `detail` returns
+            // the same remote (`info`, `state`) without downloading up to
+            // 10 000 remotes just to resolve one id.
+            let remote = with_token(http, cfg, path, refresh_on_expired, |tok| {
+                api.detail(tok, id)
+            })?;
             emit_json(json, &remote)?;
             if !json {
                 let online = if remote.state.as_ref().is_some_and(|s| s.is_online()) {
@@ -207,7 +222,11 @@ pub fn run(
             let new_name = new_name.as_deref().context("missing <NEW_NAME>")?;
             // Preserve the memo: fetch the current description first, then send
             // both fields together (the PATCH endpoint always updates both).
-            let current = with_token(http, cfg, path, refresh_on_expired, |tok| api.find(tok, id))?;
+            // `detail` carries `info.description`, so the list+scan `find` is
+            // not needed to read one remote's memo.
+            let current = with_token(http, cfg, path, refresh_on_expired, |tok| {
+                api.detail(tok, id)
+            })?;
             with_token(http, cfg, path, refresh_on_expired, |tok| {
                 api.update(
                     tok,
@@ -224,7 +243,11 @@ pub fn run(
         RemoteCmd::Memo { id, new_memo } => {
             let id = id.context("missing <ID>")?;
             let new_memo = new_memo.as_deref().context("missing <NEW_MEMO>")?;
-            let current = with_token(http, cfg, path, refresh_on_expired, |tok| api.find(tok, id))?;
+            // Same single-item lookup as rename: `info.name` comes from the
+            // console detail, so no device list has to be fetched.
+            let current = with_token(http, cfg, path, refresh_on_expired, |tok| {
+                api.detail(tok, id)
+            })?;
             with_token(http, cfg, path, refresh_on_expired, |tok| {
                 api.update(tok, id, &RemoteUpdate::new(&current.info.name, new_memo))
             })?;

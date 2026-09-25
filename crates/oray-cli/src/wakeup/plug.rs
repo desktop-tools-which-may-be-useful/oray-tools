@@ -4,16 +4,20 @@
 //!
 //! # `--json` output contract
 //!
-//! - With `--json`, every command prints **exactly one** JSON value on stdout
-//!   and only when it succeeds: one object (`plug on/off`, `led`,
+//! - With `--json`, every command prints **exactly one** JSON value on
+//!   stdout: on success one object (`plug on/off`, `led`,
 //!   `power-on-restore`, `countdown start/stop`, `timer remove`,
 //!   `timer enable/disable`) or one of the shapes that already existed and
 //!   stay untouched (`plug status`, `plug logs` array, `timer list` array,
-//!   `timer add` SetResp, `countdown status`).
-//! - A failure always `bail!`s: main.rs prints `error: ...` on stderr and
-//!   exits 1, identically in JSON and text mode. No branch swallows an error
-//!   just because `--json` was passed, and no success path prints an empty
-//!   stdout in JSON mode.
+//!   `timer add` SetResp, `countdown status`); on failure exactly one error
+//!   object (next bullet).
+//! - A failure always `bail!`s: with `--json`, main.rs prints
+//!   `{"ok": false, "error": "<message>"}` on **stdout** — one object
+//!   carrying the very message the text mode prints — and exits 1, so a
+//!   consumer parsing stdout always sees exactly one value; without
+//!   `--json` the single `error: ...` line goes to stderr, byte-identical
+//!   to before. No branch swallows an error just because `--json` was
+//!   passed, and no success path prints an empty stdout in JSON mode.
 //! - Text-mode output is unchanged, except that an empty `logs` result now
 //!   says so (`no matching events`) instead of printing nothing.
 //!
@@ -379,7 +383,14 @@ pub enum CountdownCmd {
 }
 
 /// `--interactive`: type the arguments this command line left out.
-pub fn fill(cmd: &mut PlugCmd) -> Result<()> {
+///
+/// A no-op unless the flag is set (defense in depth on top of clap's strict
+/// build in main.rs): prompting must be unreachable without
+/// `--interactive`, whatever `strictify` marks as required.
+pub fn fill(cmd: &mut PlugCmd, interactive: bool) -> Result<()> {
+    if !interactive {
+        return Ok(());
+    }
     match cmd {
         PlugCmd::Status { sn, .. } => fill_sn(sn, "oray-tools wakeup plug status <sn>"),
         PlugCmd::On { sn, .. } => fill_sn(sn, "oray-tools wakeup plug on <sn>"),

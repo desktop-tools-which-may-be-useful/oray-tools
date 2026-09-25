@@ -104,6 +104,17 @@ fn base_command() -> clap::Command {
 /// value with clap's own wording — byte for byte the message the command
 /// produced before `--interactive` existed.
 ///
+/// The `"time" | "count"` list names the fillable *long options* (fillable
+/// positionals are covered by `is_positional`); it must stay in sync with
+/// the `fill` implementations in `auth.rs` / `wakeup` / `remote`. The
+/// invariant that keeps a stale list from breaking the `--interactive`
+/// contract is enforced one level down: every `fill` is a no-op unless
+/// `cli.interactive` is set (see the call sites in [`run`]), so a missing
+/// entry here can no longer cause a surprise prompt — it would only change
+/// the native error text. An entry here for an argument that is *not*
+/// fillable would wrongly make an optional argument required, so add one
+/// only when the matching `fill` can actually prompt for it.
+///
 /// [`clap::Command::mut_subcommands`] maps the whole tree in place and keeps
 /// the subcommand order the help output depends on
 /// ( [`clap::Command::mut_subcommand`] would push the touched command to the
@@ -139,13 +150,33 @@ fn resolve(base: clap::Command, argv: &[OsString]) -> Result<Cli, clap::Error> {
     Cli::from_arg_matches(&strict.try_get_matches_from(argv)?)
 }
 
+/// The `--json` failure body: exactly one object on stdout carrying
+/// `ok: false` and the same message text the text mode prints as a single
+/// `error: ...` line on stderr. Pure, so the failure shape is unit-testable
+/// without spawning the binary — and the single source of truth for what a
+/// `--json` consumer sees when a command fails (stdout was empty before, and
+/// the error only existed as prose on stderr).
+fn json_error_body(message: &str) -> String {
+    serde_json::json!({ "ok": false, "error": message }).to_string()
+}
+
 fn main() {
     let argv: Vec<OsString> = std::env::args_os().collect();
     let cli = resolve(base_command(), &argv).unwrap_or_else(|e| e.exit());
     support::set_verbose(cli.verbose);
     support::set_raw_trace(cli.trace_raw);
+    // Read before `cli` is moved into `run`: with `--json` the failure goes
+    // to stdout as one JSON object instead of the stderr line, so a consumer
+    // parsing stdout always finds exactly one value — and only one source of
+    // truth for the message (no error line on stderr in JSON mode).
+    let json = cli.json;
     if let Err(e) = run(cli) {
-        eprintln!("error: {e:#}");
+        let message = format!("{e:#}");
+        if json {
+            println!("{}", json_error_body(&message));
+        } else {
+            eprintln!("error: {message}");
+        }
         std::process::exit(1);
     }
 }
@@ -154,7 +185,13 @@ fn run(mut cli: Cli) -> Result<()> {
     let http = HttpClient::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()?;
-    let (mut cfg, path) = Config::load(cli.config.as_ref())?;
+    // `--config` is the explicit path: it must exist (a typo is an error
+    // naming the path). Without the flag the platform default may not exist
+    // yet — a fresh install starts from `Config::default()`.
+    let (mut cfg, path) = match cli.config.as_deref() {
+        Some(explicit) => Config::load_explicit(explicit)?,
+        None => Config::load()?,
+    };
     // `--clientid` overrides the trusted client id for this run and is
     // persisted by the next save — the same semantics as
     // `auth login --clientid`. Writing it into the config *before* anything
@@ -169,11 +206,14 @@ fn run(mut cli: Cli) -> Result<()> {
     // --interactive: complete the missing arguments before anything is
     // fetched or sent (and before anything can block on stdin unnoticed).
     // Without the flag the parse above already rejected every missing value,
-    // so nothing here has a `None` left to ask about.
+    // so nothing here has a `None` left to ask about — and, defense in
+    // depth, each `fill` returns immediately unless `cli.interactive` is
+    // set, so no prompt is reachable without the flag no matter what
+    // `strictify`'s fillable-argument list above marks as required.
     match &mut cli.command {
-        Command::Auth { sub } => auth::fill(sub, &cfg)?,
-        Command::Wakeup { sub, .. } => wakeup::fill(sub)?,
-        Command::Remote { sub, .. } => remote::fill(sub)?,
+        Command::Auth { sub } => auth::fill(sub, &cfg, cli.interactive)?,
+        Command::Wakeup { sub, .. } => wakeup::fill(sub, cli.interactive)?,
+        Command::Remote { sub, .. } => remote::fill(sub, cli.interactive)?,
     }
     let json = cli.json;
     let tz = match cli.tz.as_deref() {
@@ -253,11 +293,81 @@ mod tests {
         assert!(support::parse_on_off("maybe").is_err());
     }
 
+    /// The `--json` failure contract: stdout gets exactly one object with
+    /// `ok: false` and the very message the text mode prints after
+    /// `error: ` on stderr — so a consumer never sees an empty stdout.
+    #[test]
+    fn json_error_body_is_one_object_carries_the_message() {
+        let message = "invalid time bound '3天': use an ago duration like 30m/2h/1d";
+        let body = json_error_body(message);
+        // One JSON value, nothing else on the "stream".
+        let parsed: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("{body} is not a single JSON value: {e}"));
+        assert_eq!(parsed, serde_json::json!({ "ok": false, "error": message }));
+        assert_eq!(parsed["ok"], false);
+        // The message text is carried verbatim (no `error: ` prefix, no
+        // rewording), so both modes say the same thing.
+        assert_eq!(parsed["error"].as_str(), Some(message));
+        assert!(
+            parsed["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("invalid time bound")
+        );
+        // Quote characters stay escaped inside the JSON string.
+        let quoted = json_error_body(r#"he said "no""#);
+        assert!(quoted.contains(r#"he said \"no\""#), "{quoted}");
+    }
+
     #[test]
     fn default_config_has_no_device_storage() {
         let cfg = Config::default();
         assert!(cfg.server.is_none());
         assert!(cfg.token.is_none());
+    }
+
+    /// Without `--interactive` no `fill` may reach a prompt: each one
+    /// returns immediately and leaves its slots empty. A fill that did try
+    /// to prompt would either fail `require_terminal` (stdin is not a
+    /// terminal under `cargo test`, so `.unwrap()` panics) or — worse —
+    /// block on the read, so `Ok` with untouched slots is the contract.
+    #[test]
+    fn fill_is_a_noop_without_the_interactive_flag() {
+        let mut login = auth::AuthCmd::Login {
+            account: None,
+            password: None,
+        };
+        auth::fill(&mut login, &Config::default(), false).unwrap();
+        assert!(
+            matches!(
+                login,
+                auth::AuthCmd::Login {
+                    account: None,
+                    password: None
+                }
+            ),
+            "auth fill must not fill anything without the flag"
+        );
+
+        let mut info = wakeup::WakeupCmd::Info { sn: None };
+        wakeup::fill(&mut info, false).unwrap();
+        assert!(matches!(info, wakeup::WakeupCmd::Info { sn: None }));
+
+        // The nested plug group is gated the same way.
+        let mut plug = wakeup::WakeupCmd::Plug {
+            sub: wakeup::plug::PlugCmd::Status { sn: None, index: 0 },
+        };
+        wakeup::fill(&mut plug, false).unwrap();
+        assert!(matches!(
+            plug,
+            wakeup::WakeupCmd::Plug {
+                sub: wakeup::plug::PlugCmd::Status { sn: None, .. }
+            }
+        ));
+
+        let mut status = remote::RemoteCmd::Status { id: None };
+        remote::fill(&mut status, false).unwrap();
+        assert!(matches!(status, remote::RemoteCmd::Status { id: None }));
     }
 
     #[test]

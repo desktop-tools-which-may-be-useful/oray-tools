@@ -80,6 +80,12 @@ pub struct WakeupDevicesResponse {
     pub devices: Vec<WakeupDevice>,
 }
 
+/// The page cap of `/wakeup/devices`: `list` only ever asks for the first
+/// page (`offset=0&limit=<here>`), so this is also the number of devices
+/// [`WakeupApi::find`] can scan — both the URL and the "not found" message
+/// are derived from it so they cannot drift apart.
+const DEVICE_LIST_LIMIT: usize = 100;
+
 /// Build `GET {api_base}/wakeup/devices?offset=0&limit=100[&sn=...]`, with
 /// every query value percent-encoded the way
 /// `application/x-www-form-urlencoded` requires (space -> `+`; `&`, `+` and
@@ -92,12 +98,33 @@ fn device_list_url(api_base: &str, sn: Option<&str>) -> Result<String> {
         reqwest::Url::parse(&base).map_err(|e| Error::Api(format!("invalid api base: {e}")))?;
     {
         let mut query = url.query_pairs_mut();
-        query.append_pair("offset", "0").append_pair("limit", "100");
+        query
+            .append_pair("offset", "0")
+            .append_pair("limit", &DEVICE_LIST_LIMIT.to_string());
         if let Some(sn) = sn {
             query.append_pair("sn", sn);
         }
     }
     Ok(url.to_string())
+}
+
+/// The URL [`WakeupApi::find`] lists with: the server-side `sn` filter
+/// always present, so a find never downloads an unrelated page. Kept as the
+/// single place `find` builds its query so tests can pin the `sn=` pair.
+fn find_list_url(api_base: &str, sn: &str) -> Result<String> {
+    device_list_url(api_base, Some(sn))
+}
+
+/// The "not found" message of [`WakeupApi::find`], stating how many devices
+/// were actually looked at and that the scan stops at the page cap — the
+/// same honesty as `RemoteApi::find`'s "not among the first N remotes
+/// listed", so an account holding more devices than the cap is not left
+/// guessing why a real SN was missed.
+fn find_not_found_message(sn: &str, scanned: usize) -> String {
+    format!(
+        "wakeup device sn={sn} not found among {scanned} devices listed (only the first \
+         {DEVICE_LIST_LIMIT} are scanned)"
+    )
 }
 
 impl WakeupApi {
@@ -128,11 +155,23 @@ impl WakeupApi {
         trace::expect_2xx(ex, what)
     }
 
-    /// List all wakeup-capable devices. Optionally filter to one SN
+    /// List wakeup devices. Optionally filter to one SN
     /// (`/wakeup/devices?sn=<sn>`); the SN is percent-encoded.
+    ///
+    /// Only the **first page** is fetched (`offset=0`, `limit` being the
+    /// [`DEVICE_LIST_LIMIT`] constant, 100): accounts with more devices see
+    /// just that first hundred, which is also all [`find`](Self::find) can
+    /// scan.
     pub fn list(&self, token: &str, sn: Option<&str>) -> TracedResult<WakeupDevicesResponse> {
         let url = device_list_url(&self.api_base, sn)?;
-        let (calls, text) = self.send(token, "list wakeup devices", &url)?;
+        self.list_at(token, &url)
+    }
+
+    /// Issue the device-list request for an already built URL (shared by
+    /// [`list`](Self::list) and [`find`](Self::find), which always carries
+    /// the `sn=` filter).
+    fn list_at(&self, token: &str, url: &str) -> TracedResult<WakeupDevicesResponse> {
+        let (calls, text) = self.send(token, "list wakeup devices", url)?;
         trace::finish(
             calls,
             serde_json::from_str(&text).map_err(|e| Error::bad_body(text, e)),
@@ -140,16 +179,31 @@ impl WakeupApi {
     }
 
     /// Look up a single device by SN.
+    ///
+    /// The request carries the server-side `sn` filter (`list` has always
+    /// supported it, but `find` used to pass `None`, which both downloaded an
+    /// unrelated page and left that filter dead in production); the result is
+    /// still scanned client-side below, so behaviour stays correct even if a
+    /// server ignores the parameter.
+    ///
+    /// Like [`list`](Self::list), at most [`DEVICE_LIST_LIMIT`] devices are
+    /// ever seen — a miss therefore reports how many devices were listed and
+    /// that only the first 100 are scanned, mirroring `RemoteApi::find`'s
+    /// "not among the first N listed" wording, instead of a bare
+    /// "not found".
     pub fn find(&self, token: &str, sn: &str) -> TracedResult<WakeupDevice> {
-        let all = self.list(token, None)?;
+        let url = find_list_url(&self.api_base, sn)?;
+        let all = self.list_at(token, &url)?;
         let calls = all.calls;
-        match all.data.devices.into_iter().find(|d| d.sn == sn) {
+        let devices = all.data.devices;
+        let scanned = devices.len();
+        match devices.into_iter().find(|d| d.sn == sn) {
             Some(device) => Ok(Traced {
                 data: device,
                 calls,
             }),
             None => Err(TracedError {
-                error: Error::Api(format!("wakeup device sn={sn} not found")),
+                error: Error::Api(find_not_found_message(sn, scanned)),
                 calls,
             }),
         }
@@ -218,5 +272,36 @@ mod tests {
         assert_eq!(weird.matches("sn=").count(), 1);
         // `?offset=0&limit=100&sn=…` — the only two separators in the URL.
         assert_eq!(weird.matches('&').count(), 2);
+    }
+
+    /// `find` must issue the server-side `sn=` filter (it used to call
+    /// `list(token, None)`, so the filter branch was dead in production and
+    /// a find always downloaded a whole unrelated page).
+    #[test]
+    fn find_url_carries_the_sn_filter() {
+        let url = find_list_url("https://api-std.sunlogin.oray.com", "100000000001").unwrap();
+        assert_eq!(
+            url,
+            "https://api-std.sunlogin.oray.com/wakeup/devices?offset=0&limit=100&sn=100000000001"
+        );
+        // The page cap rides the same constant the message below quotes.
+        assert_eq!(DEVICE_LIST_LIMIT, 100);
+    }
+
+    /// A miss has to say how many devices were listed and that the scan
+    /// stops at the page cap — an account with more than 100 devices would
+    /// otherwise get a bare "not found" for a device the tool never fetched.
+    #[test]
+    fn find_not_found_message_reports_the_scanned_count_and_cap() {
+        assert_eq!(
+            find_not_found_message("100000000001", 100),
+            "wakeup device sn=100000000001 not found among 100 devices listed (only the first \
+             100 are scanned)"
+        );
+        // Fewer devices than the cap: the count is what was actually listed.
+        let msg = find_not_found_message("42", 3);
+        assert!(msg.contains("among 3 devices listed"), "{msg}");
+        assert!(msg.contains("only the first 100 are scanned"), "{msg}");
+        assert!(msg.starts_with("wakeup device sn=42 not found"), "{msg}");
     }
 }

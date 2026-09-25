@@ -5,14 +5,18 @@
 //!
 //! # `--json` output contract
 //!
-//! - With `--json`, every command prints **exactly one** JSON value on stdout
-//!   and only when it succeeds: an object (`rename`, `memo`) or one of the
-//!   shapes that already existed and stay untouched (`list`, `info`, plus
-//!   everything the [`plug`] submodule emits).
-//! - A failure always `bail!`s: main.rs prints `error: ...` on stderr and
-//!   exits 1, identically in JSON and text mode. No branch swallows an error
-//!   just because `--json` was passed, and no success path prints an empty
-//!   stdout in JSON mode.
+//! - With `--json`, every command prints **exactly one** JSON value on
+//!   stdout: on success an object (`rename`, `memo`) or one of the shapes
+//!   that already existed and stay untouched (`list`, `info`, plus
+//!   everything the [`plug`] submodule emits); on failure exactly one error
+//!   object (next bullet).
+//! - A failure always `bail!`s: with `--json`, main.rs prints
+//!   `{"ok": false, "error": "<message>"}` on **stdout** — one object
+//!   carrying the very message the text mode prints — and exits 1, so a
+//!   consumer parsing stdout always sees exactly one value; without
+//!   `--json` the single `error: ...` line goes to stderr, byte-identical
+//!   to before. No branch swallows an error just because `--json` was
+//!   passed, and no success path prints an empty stdout in JSON mode.
 //! - Text-mode output is unchanged.
 
 pub mod plug;
@@ -72,7 +76,14 @@ fn json_memo(sn: &str, memo: &str) -> serde_json::Value {
 }
 
 /// `--interactive`: type the arguments this command line left out.
-pub fn fill(cmd: &mut WakeupCmd) -> Result<()> {
+///
+/// A no-op unless the flag is set (defense in depth on top of clap's strict
+/// build in main.rs): prompting must be unreachable without
+/// `--interactive`, whatever `strictify` marks as required.
+pub fn fill(cmd: &mut WakeupCmd, interactive: bool) -> Result<()> {
+    if !interactive {
+        return Ok(());
+    }
     match cmd {
         WakeupCmd::List => Ok(()),
         WakeupCmd::Info { sn } => fill_sn(sn, "oray-tools wakeup info <sn>"),
@@ -92,7 +103,7 @@ pub fn fill(cmd: &mut WakeupCmd) -> Result<()> {
             prompt::fill_str(sn, SN_LABEL, None)?;
             prompt::fill_str(new_memo, "New memo", None)
         }
-        WakeupCmd::Plug { sub } => plug::fill(sub),
+        WakeupCmd::Plug { sub } => plug::fill(sub, interactive),
     }
 }
 

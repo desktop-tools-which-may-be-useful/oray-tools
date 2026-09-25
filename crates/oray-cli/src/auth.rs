@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use oray_core::auth::{AuthApi, LoginOutcome};
 use reqwest::blocking::Client as HttpClient;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 #[derive(Subcommand)]
@@ -16,6 +17,11 @@ pub enum AuthCmd {
         /// Oray account (mobile number or email)
         account: Option<String>,
         /// Account password (stored locally as md5)
+        ///
+        /// SECURITY: a password given as an argument is visible to other
+        /// local processes (`ps`, `/proc/*/cmdline`) and lands in your shell
+        /// history. Prefer `oray-tools auth login --interactive`, which
+        /// reads the password without echoing it.
         password: Option<String>,
     },
     /// Log in with an SMS code instead of a password (`auth login-sms`)
@@ -49,10 +55,16 @@ pub enum AuthCmd {
 /// `--interactive`: type the arguments the command line left out.
 ///
 /// Without the flag clap rejects a missing argument before this runs, so
-/// every `None` below is one the user explicitly asked to be prompted for.
-/// The login method is never a choice here — it is the subcommand itself
-/// (`login` = account + password, `login-sms` = mobile number).
-pub fn fill(cmd: &mut AuthCmd, cfg: &Config) -> Result<()> {
+/// every `None` below is one the user explicitly asked to be prompted for —
+/// and `interactive` gates that explicitly too: this is a no-op unless the
+/// flag is set, so no code path can reach a prompt without `--interactive`
+/// even if `strictify`'s fillable-argument list (main.rs) ever falls out of
+/// sync. The login method is never a choice here — it is the subcommand
+/// itself (`login` = account + password, `login-sms` = mobile number).
+pub fn fill(cmd: &mut AuthCmd, cfg: &Config, interactive: bool) -> Result<()> {
+    if !interactive {
+        return Ok(());
+    }
     match cmd {
         AuthCmd::Login { account, password } => {
             prompt::require_terminal(
@@ -170,6 +182,20 @@ fn prompt_code() -> Result<String> {
     )
 }
 
+/// Whether a flow that is about to *request* an SMS code cannot possibly
+/// collect it: no code was supplied up front and stdin is not a terminal,
+/// so the read at the end of the flow would fail anyway. Pure (both inputs
+/// are decided by the caller) so the fail-fast decision is testable without
+/// a TTY.
+///
+/// The point is *when* the failure happens: without this guard a scripted
+/// run sits through the whole captcha wait (up to 300 s) and consumes a
+/// daily SMS request (`daily request #n`) before `prompt_code` reports that
+/// stdin ended — the side effects have already happened for nothing.
+fn code_unreachable(has_code: bool, is_terminal: bool) -> bool {
+    !has_code && !is_terminal
+}
+
 fn do_login(
     http: &HttpClient,
     cfg: &mut Config,
@@ -187,6 +213,18 @@ fn do_login(
     let resp = match traced("login", api.login(&cid, account, &password_md5))? {
         LoginOutcome::Tokens(resp) => resp,
         LoginOutcome::NewDevice(alert) => {
+            // Fail before the SMS request below: without a terminal nobody
+            // can read the code `prompt_code` is about to ask for, and
+            // `sendcode` would consume a daily SMS slot for nothing. (This
+            // flow has no `--code` escape hatch — hence `has_code = false`.)
+            if code_unreachable(false, std::io::stdin().is_terminal()) {
+                bail!(
+                    "new-device SMS verification is required ({}), but stdin is not a terminal \
+                     so the code could not be read: run `oray-tools auth login <account> \
+                     <password>` in a terminal to complete it",
+                    alert.error
+                );
+            }
             let target = if !alert.mobile.is_empty() {
                 &alert.mobile
             } else {
@@ -254,6 +292,18 @@ fn do_login_sms(
     json: bool,
 ) -> Result<()> {
     check_mobile(mobile)?;
+    // Fail fast, before anything waits or sends: without `--code` this flow
+    // ends by reading the SMS code from stdin, which is impossible when
+    // stdin is not a terminal. Waiting out the captcha (up to 300 s) and
+    // burning a daily SMS request first would only defer an error that is
+    // certain — so check before `obtain_token` / `send_login_code`.
+    if code_unreachable(opts.code.is_some(), std::io::stdin().is_terminal()) {
+        bail!(
+            "stdin is not a terminal, so the SMS code could not be read: pass `--code <CODE>` \
+             with a code you already have (it skips the captcha and the SMS request), or run \
+             `oray-tools auth login-sms <mobile> --interactive` in a terminal"
+        );
+    }
     let cid = resolve_clientid(cfg, clientid);
     let server = cfg.server();
     let api = AuthApi::new(http.clone(), &server.api_base).shield_base(&server.shield_base);
@@ -392,4 +442,25 @@ fn do_logout(cfg: &mut Config, path: &PathBuf, json: bool) -> Result<()> {
         println!("logged out");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fail-fast decision shared by both login flows (see
+    /// [`code_unreachable`]): it only fires when a code will certainly be
+    /// requested *and* cannot be collected.
+    #[test]
+    fn sms_code_guard_fails_only_without_code_and_terminal() {
+        // `echo | oray-tools auth login-sms <mobile>`: bail immediately,
+        // before the captcha wait and before any SMS-consuming request.
+        assert!(code_unreachable(false, false));
+        // `--code 123456` skips the captcha + SMS and proceeds (it does not
+        // read the code from stdin).
+        assert!(!code_unreachable(true, false));
+        // A real terminal keeps behaving exactly as before.
+        assert!(!code_unreachable(false, true));
+        assert!(!code_unreachable(true, true));
+    }
 }

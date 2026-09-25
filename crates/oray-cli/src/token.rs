@@ -5,22 +5,35 @@ use oray_core::auth::{AuthApi, AuthResponse};
 use reqwest::blocking::Client as HttpClient;
 use std::path::PathBuf;
 
-/// Absolute unix timestamp at which the access token expires,
-/// computed per Oray's recommendation as `now + (exp - isa)`.
+/// Safety skew applied by [`is_access_expired`]: a token is treated as
+/// expired this many seconds *before* its `exp`, so a request launched right
+/// at the boundary (or a slightly fast local clock) does not go out with an
+/// already-dead token.
+const EXPIRY_SKEW_SECS: i64 = 45;
+
+/// Absolute unix timestamp at which the access token expires, read verbatim
+/// from the JWT `exp` claim — standard JWT semantics: `exp` *is* the
+/// absolute expiry.
+///
+/// The previous rule was `now + (exp - isa)`, which re-anchored the expiry
+/// to the moment of the check: `is_access_expired` then reduced to
+/// `exp <= isa` (false for every well-formed token, so a refresh was never
+/// proactively triggered) and `auth status` displayed an expiry counted from
+/// *now* instead of from the token. The `isa`/`iat` claims are no longer
+/// consulted at all; a token without `exp` yields `None`, which
+/// [`is_access_expired`] treats as expired so a refresh is attempted.
 pub fn access_expiry(token: &str) -> Option<i64> {
-    let payload = jwt_payload(token)?;
-    let exp = payload.get("exp")?.as_i64()?;
-    let isa = payload
-        .get("isa")
-        .and_then(|v| v.as_i64())
-        .or_else(|| payload.get("iat").and_then(|v| v.as_i64()))?;
-    let now = chrono::Utc::now().timestamp();
-    Some(now + (exp - isa))
+    jwt_payload(token)?.get("exp")?.as_i64()
 }
 
+/// Whether the access token should be refreshed before use: its absolute
+/// `exp` (from [`access_expiry`]) is at most [`EXPIRY_SKEW_SECS`] away from
+/// now, or the token carries no readable expiry at all (`None => true`, so
+/// an unparseable token still goes through the refresh path instead of being
+/// sent to the server and failing there).
 pub fn is_access_expired(token: &str) -> bool {
     match access_expiry(token) {
-        Some(exp) => exp <= chrono::Utc::now().timestamp(),
+        Some(exp) => exp <= chrono::Utc::now().timestamp() + EXPIRY_SKEW_SECS,
         None => true,
     }
 }
@@ -165,5 +178,53 @@ mod tests {
         let r = resp(r#"{"access_token":"a","refresh_token":"b","refresh_expires":null}"#);
         assert_eq!(r.refresh_expires, RefreshExpires::Unknown);
         assert_relative(&r, THIRTY_DAYS);
+    }
+
+    /// Build a JWT-shaped string (`header.payload.signature`) whose payload
+    /// is `payload` JSON. Only the middle segment is ever decoded, so the
+    /// header/signature contents are irrelevant — these tests are offline.
+    fn jwt(payload: &str) -> String {
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
+        format!("eyJhbGciOiJIUzI1NiJ9.{encoded}.c2lnbmF0dXJl")
+    }
+
+    /// `access_expiry` is the token's absolute `exp`, not a value re-anchored
+    /// to the clock: this token really expired at 1970-01-01 00:16:40 UTC.
+    #[test]
+    fn access_expiry_returns_the_absolute_exp() {
+        // The token from the bug report: exp=1000, isa=500. The old rule
+        // displayed `now + 500` and never considered the token expired.
+        assert_eq!(access_expiry(&jwt(r#"{"exp":1000,"isa":500}"#)), Some(1000));
+        assert!(is_access_expired(&jwt(r#"{"exp":1000,"isa":500}"#)));
+    }
+
+    #[test]
+    fn is_access_expired_false_for_far_future_exp() {
+        let far = chrono::Utc::now().timestamp() + 3600;
+        let token = jwt(&format!(r#"{{"exp":{far},"isa":0}}"#));
+        assert_eq!(access_expiry(&token), Some(far));
+        assert!(!is_access_expired(&token));
+    }
+
+    /// Inside the skew window the token counts as expired so the next request
+    /// does not start with a token that dies in flight.
+    #[test]
+    fn is_access_expired_true_inside_the_skew_window() {
+        let almost = chrono::Utc::now().timestamp() + EXPIRY_SKEW_SECS - 5;
+        assert!(is_access_expired(&jwt(&format!(r#"{{"exp":{almost}}}"#))));
+    }
+
+    /// A token that cannot be parsed at all, or carries no `exp`, counts as
+    /// expired (`None => true`): the refresh path must still be attempted
+    /// instead of shipping a token the server will reject.
+    #[test]
+    fn is_access_expired_true_without_readable_expiry() {
+        // No `.` segments: not a JWT.
+        assert_eq!(access_expiry("not-a-jwt"), None);
+        assert!(is_access_expired("not-a-jwt"));
+        // Parses, but has no `exp` claim (the old code demanded `isa`/`iat`
+        // too and failed the same way).
+        assert_eq!(access_expiry(&jwt(r#"{"isa":500,"iat":500}"#)), None);
+        assert!(is_access_expired(&jwt(r#"{"isa":500,"iat":500}"#)));
     }
 }

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -63,16 +63,24 @@ impl Config {
         Ok(dir.join("config.toml"))
     }
 
-    pub fn load(path: Option<&PathBuf>) -> Result<(Config, PathBuf)> {
-        let p = path.cloned().unwrap_or(Self::default_path()?);
-        if !p.exists() {
-            return Ok((Config::default(), p));
-        }
-        let raw =
-            std::fs::read_to_string(&p).with_context(|| format!("read config {}", p.display()))?;
-        let cfg: Config =
-            toml::from_str(&raw).with_context(|| format!("parse config {}", p.display()))?;
-        Ok((cfg, p))
+    /// Load the config from the platform default path.
+    ///
+    /// A fresh install has no file yet, so a missing default path silently
+    /// yields [`Config::default()`] — unlike [`load_explicit`], where a
+    /// missing file is an error, because there the path was named by the
+    /// user.
+    pub fn load() -> Result<(Config, PathBuf)> {
+        load_at(Self::default_path()?, false)
+    }
+
+    /// Load the config from a path given explicitly (`--config`).
+    ///
+    /// A missing file is an **error naming the path**: a typo'd `--config`
+    /// (`--config /hme/.../config.toml`) used to be accepted silently, so
+    /// the CLI ran account-less and the next `auth login` wrote credentials
+    /// to the typo'd location, far away from the real config.
+    pub fn load_explicit(path: &std::path::Path) -> Result<(Config, PathBuf)> {
+        load_at(path.to_path_buf(), true)
     }
 
     /// Persist the config atomically with owner-only permissions.
@@ -108,6 +116,29 @@ impl Config {
     pub fn server(&self) -> Server {
         self.server.clone().unwrap_or_default().normalized()
     }
+}
+
+/// Read the config at `path`.
+///
+/// `explicit` records where the path came from: `true` for a path the user
+/// named on the command line (a missing file is then an error — see
+/// [`Config::load_explicit`]), `false` for the platform default, where a
+/// fresh install simply has no file yet and defaults apply.
+fn load_at(path: PathBuf, explicit: bool) -> Result<(Config, PathBuf)> {
+    if !path.exists() {
+        if explicit {
+            bail!(
+                "config file not found: {} (given via --config; fix the path or create the file)",
+                path.display()
+            );
+        }
+        return Ok((Config::default(), path));
+    }
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("read config {}", path.display()))?;
+    let cfg: Config =
+        toml::from_str(&raw).with_context(|| format!("parse config {}", path.display()))?;
+    Ok((cfg, path))
 }
 
 /// Sibling temporary file used by [`Config::save`]: the target name plus the
@@ -243,8 +274,9 @@ slapi_base = "https://slapi.example.net"
 
     /// The config holds credentials: `save` must create it `0600` (not the
     /// `0644` a plain write would get under umask 022), the bytes must load
-    /// back through `Config::load`, a second save must replace the existing
-    /// file (the `rename` path), and no temporary file may be left behind.
+    /// back through `Config::load_explicit`, a second save must replace the
+    /// existing file (the `rename` path), and no temporary file may be left
+    /// behind.
     #[cfg(unix)]
     #[test]
     fn save_is_private_reloadable_and_replaces_atomically() {
@@ -276,7 +308,7 @@ slapi_base = "https://slapi.example.net"
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o7777, 0o600, "fresh config must be owner-only");
 
-        let (loaded, loaded_path) = Config::load(Some(&path)).unwrap();
+        let (loaded, loaded_path) = Config::load_explicit(&path).unwrap();
         assert_eq!(loaded_path, path);
         assert_eq!(loaded.account.as_ref().unwrap().account, "demo");
         assert_eq!(loaded.token.as_ref().unwrap().refresh_expires, 123);
@@ -288,7 +320,7 @@ slapi_base = "https://slapi.example.net"
         second.save(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o7777, 0o600, "overwritten config stays owner-only");
-        let (reloaded, _) = Config::load(Some(&path)).unwrap();
+        let (reloaded, _) = Config::load_explicit(&path).unwrap();
         assert_eq!(reloaded.token.unwrap().refresh_expires, 456);
 
         // The temporary file never survives a successful save.
@@ -300,6 +332,68 @@ slapi_base = "https://slapi.example.net"
             .collect();
         assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A typo'd `--config` must fail loudly, naming the path — it used to be
+    /// accepted silently, running the CLI account-less and pointing the next
+    /// `auth login`'s save at the typo'd location.
+    #[test]
+    fn explicit_missing_config_is_an_error_naming_the_path() {
+        let missing = std::env::temp_dir().join(format!(
+            "oray-tools-explicit-missing-config-{}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing);
+        let err = Config::load_explicit(&missing).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("not found"), "{text}");
+        assert!(
+            text.contains(&missing.display().to_string()),
+            "error must name the path: {text}"
+        );
+    }
+
+    /// The platform default path keeps defaulting silently: a fresh install
+    /// simply has no config file yet.
+    #[test]
+    fn missing_default_config_falls_back_to_defaults() {
+        let missing = std::env::temp_dir().join(format!(
+            "oray-tools-default-missing-config-{}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing);
+        let (cfg, path) = load_at(missing.clone(), false).unwrap();
+        assert_eq!(path, missing);
+        // The same value a never-configured install starts from.
+        assert_eq!(
+            serde_json::to_value(&cfg).unwrap(),
+            serde_json::to_value(Config::default()).unwrap()
+        );
+    }
+
+    /// The explicit branch only errors while the file is missing: an
+    /// existing `--config` path loads like before.
+    #[test]
+    fn explicit_existing_config_loads() {
+        let dir = std::env::temp_dir().join(format!(
+            "oray-tools-explicit-present-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        Config {
+            account: Some(Account {
+                account: "demo".into(),
+                password_md5: "abc".into(),
+            }),
+            ..Default::default()
+        }
+        .save(&path)
+        .unwrap();
+        let (cfg, loaded) = Config::load_explicit(&path).unwrap();
+        assert_eq!(loaded, path);
+        assert_eq!(cfg.account.unwrap().account, "demo");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
