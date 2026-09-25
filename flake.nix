@@ -20,7 +20,8 @@
         {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "oray-tools";
-            version = "1.0.2";
+            # single source of truth: the workspace version in Cargo.toml
+            version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
             meta = with pkgs.lib; {
