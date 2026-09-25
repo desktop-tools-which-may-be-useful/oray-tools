@@ -2,6 +2,21 @@
 //!
 //! Outlet switching/status, logs, timers, countdown, LED and power-restore.
 //!
+//! # `--json` output contract
+//!
+//! - With `--json`, every command prints **exactly one** JSON value on stdout
+//!   and only when it succeeds: one object (`plug on/off`, `led`,
+//!   `power-on-restore`, `countdown start/stop`, `timer remove`,
+//!   `timer enable/disable`) or one of the shapes that already existed and
+//!   stay untouched (`plug status`, `plug logs` array, `timer list` array,
+//!   `timer add` SetResp, `countdown status`).
+//! - A failure always `bail!`s: main.rs prints `error: ...` on stderr and
+//!   exits 1, identically in JSON and text mode. No branch swallows an error
+//!   just because `--json` was passed, and no success path prints an empty
+//!   stdout in JSON mode.
+//! - Text-mode output is unchanged, except that an empty `logs` result now
+//!   says so (`no matching events`) instead of printing nothing.
+//!
 //! Timer scheduling: the plug API stores schedule times in UTC minutes of the
 //! day and weekday bits over UTC days, while the user-facing (App) semantics
 //! are local time with weekdays starting Monday. The helpers below convert
@@ -17,50 +32,92 @@ use crate::support::{
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use clap::Subcommand;
+use oray_core::trace::TracedResult;
 use oray_core::wakeup::plug::{PlugApi, PlugTimer, StatusLog, StatusLogsData};
 use reqwest::blocking::Client as HttpClient;
 use std::path::PathBuf;
 
-/// Fetch one page of status-change logs (page 1 is the newest).
-fn fetch_logs_page(
-    http: &HttpClient,
-    cfg: &mut Config,
-    path: &PathBuf,
+/// Everything the `wakeup plug` handlers need besides their own arguments.
+///
+/// The helpers used to receive `(http, cfg, path, refresh_on_expired, ...)`
+/// one parameter at a time, which pushed `load_logs_page`, `do_timer` and
+/// `set_timer_enabled` past clippy's argument limit; bundling the plumbing
+/// here keeps every helper at five parameters or fewer. `json` (the `--json`
+/// output mode) and `tz` (the `--tz` / config timezone argument) ride along
+/// because they are properties of the current invocation, not of one command.
+struct Ctx<'a> {
+    http: &'a HttpClient,
+    cfg: &'a mut Config,
+    path: &'a PathBuf,
+    plug: &'a PlugApi,
     refresh_on_expired: bool,
-    plug: &PlugApi,
-    sn: &str,
-    page: u32,
-) -> Result<StatusLogsData> {
-    with_token(http, cfg, path, refresh_on_expired, |tok| {
-        plug.status_logs(tok, sn, page)
-    })
+    json: bool,
+    tz: Option<i64>,
+}
+
+impl Ctx<'_> {
+    /// Run an authenticated plug call with this context's token lifecycle
+    /// (refresh-on-expire plus `--verbose` trace rendering).
+    fn with_tok<T>(&mut self, run: impl Fn(&str) -> TracedResult<T>) -> Result<T> {
+        with_token(self.http, self.cfg, self.path, self.refresh_on_expired, run)
+    }
+}
+
+/// Fetch one page of status-change logs (page 1 is the newest).
+fn fetch_logs_page(ctx: &mut Ctx, sn: &str, page: u32) -> Result<StatusLogsData> {
+    let plug = ctx.plug;
+    ctx.with_tok(|tok| plug.status_logs(tok, sn, page))
 }
 
 /// Return page `p`, (re)using a cache indexed by page number.
-#[allow(clippy::too_many_arguments)]
 fn load_logs_page<'a>(
-    http: &HttpClient,
-    cfg: &mut Config,
-    path: &PathBuf,
-    refresh_on_expired: bool,
-    plug: &PlugApi,
+    ctx: &mut Ctx,
     sn: &str,
     page: u32,
     cached: &'a mut [Option<StatusLogsData>],
 ) -> Result<&'a StatusLogsData> {
     let i = page as usize;
     if cached[i].is_none() {
-        cached[i] = Some(fetch_logs_page(
-            http,
-            cfg,
-            path,
-            refresh_on_expired,
-            plug,
-            sn,
-            page,
-        )?);
+        cached[i] = Some(fetch_logs_page(ctx, sn, page)?);
     }
     Ok(cached[i].as_ref().expect("loaded page"))
+}
+
+/// Client-side port filter behind `logs --index`.
+///
+/// `--index` is optional: without it nothing is dropped (the API already
+/// returns the whole device's log, which is the historical behaviour), with
+/// it only the entries the plug reported for that port stay. Pure so it can
+/// be tested without the network.
+fn filter_logs_by_index(logs: Vec<StatusLog>, index: Option<usize>) -> Vec<StatusLog> {
+    match index {
+        None => logs,
+        Some(port) => logs
+            .into_iter()
+            .filter(|l| i64::from(l.index) == port as i64)
+            .collect(),
+    }
+}
+
+/// The text-mode lines of a `logs` query. An empty result gets an explicit
+/// notice instead of printing nothing (which looked like a hang); `--json`
+/// always prints an array (`[]` when empty) and is unaffected.
+fn logs_text_lines(logs: &[StatusLog], tz: Option<i64>) -> Vec<String> {
+    if logs.is_empty() {
+        return vec!["no matching events".to_string()];
+    }
+    logs.iter()
+        .map(|l| {
+            let state = if l.status == 1 { "ON" } else { "OFF" };
+            format!(
+                "{} index={} {} {}",
+                render_ts(l.createtime, tz),
+                l.index,
+                state,
+                l.event
+            )
+        })
+        .collect()
 }
 
 /// The `(newest, oldest)` event timestamp pair seen on a page.
@@ -178,9 +235,10 @@ pub enum PlugCmd {
     Logs {
         /// Device serial number
         sn: Option<String>,
-        /// Port index
-        #[arg(long, default_value_t = 0)]
-        index: usize,
+        /// Only keep events the plug reported for this port (filtered
+        /// client-side; omit to keep every port)
+        #[arg(long)]
+        index: Option<usize>,
         /// Lower bound: only events at or after this. Either an ago duration
         /// (30m, 2h, 1d) or an absolute time (2026-09-01, or 2026-09-01
         /// 08:30[:00]); a bare date means the start of that day. Absolute
@@ -407,6 +465,39 @@ fn fill_countdown(cmd: &mut CountdownCmd) -> Result<()> {
         CountdownCmd::Stop { sn, .. } => fill_sn(sn, "oray-tools wakeup plug countdown stop <sn>"),
     }
 }
+/// `--json` bodies of the mutating plug commands (module docs carry the
+/// contract). Kept as tiny builders so the shapes are unit-testable without
+/// a network round trip.
+fn json_plug_switch(sn: &str, index: usize, on: bool) -> serde_json::Value {
+    let status = if on { "on" } else { "off" };
+    serde_json::json!({ "ok": true, "sn": sn, "index": index, "status": status })
+}
+
+fn json_led(sn: &str, on: bool) -> serde_json::Value {
+    let led = if on { "on" } else { "off" };
+    serde_json::json!({ "ok": true, "sn": sn, "led": led })
+}
+
+fn json_power_on_restore(sn: &str, state: u32) -> serde_json::Value {
+    serde_json::json!({ "ok": true, "sn": sn, "state": state })
+}
+
+fn json_countdown_start(sn: &str, index: usize, count: u64, action: u8) -> serde_json::Value {
+    serde_json::json!({ "ok": true, "sn": sn, "index": index, "count": count, "action": action })
+}
+
+fn json_countdown_stop(sn: &str, index: usize) -> serde_json::Value {
+    serde_json::json!({ "ok": true, "sn": sn, "index": index })
+}
+
+fn json_timer_removed(sn: &str, index: usize, id: u64) -> serde_json::Value {
+    serde_json::json!({ "ok": true, "sn": sn, "index": index, "timer_id": id })
+}
+
+fn json_timer_enabled(sn: &str, index: usize, id: u64, enabled: bool) -> serde_json::Value {
+    serde_json::json!({ "ok": true, "sn": sn, "index": index, "timer_id": id, "enabled": enabled })
+}
+
 pub fn run(
     http: &HttpClient,
     cfg: &mut Config,
@@ -418,12 +509,20 @@ pub fn run(
 ) -> Result<()> {
     let server = cfg.server();
     let plug = PlugApi::new(http.clone(), &server.slapi_base);
+    // The plumbing every helper below needs, threaded once instead of per call.
+    let mut ctx = Ctx {
+        http,
+        cfg,
+        path,
+        plug: &plug,
+        refresh_on_expired,
+        json,
+        tz,
+    };
     match sub {
         PlugCmd::Status { sn, index } => {
             let sn = sn.as_deref().context("missing <SN>")?;
-            let resp = with_token(http, cfg, path, refresh_on_expired, |tok| {
-                plug.get_status(tok, sn, index)
-            })?;
+            let resp = ctx.with_tok(|tok| plug.get_status(tok, sn, index))?;
             emit_json(json, &resp)?;
             if !json {
                 if let Some(ports) = &resp.response {
@@ -439,9 +538,8 @@ pub fn run(
         }
         PlugCmd::On { sn, index } => {
             let sn = sn.as_deref().context("missing <SN>")?;
-            with_token(http, cfg, path, refresh_on_expired, |tok| {
-                plug.set_status(tok, sn, index, true)
-            })?;
+            ctx.with_tok(|tok| plug.set_status(tok, sn, index, true))?;
+            emit_json(json, &json_plug_switch(sn, index, true))?;
             if !json {
                 println!("sn={sn} index={index} ON");
             }
@@ -449,9 +547,8 @@ pub fn run(
         }
         PlugCmd::Off { sn, index } => {
             let sn = sn.as_deref().context("missing <SN>")?;
-            with_token(http, cfg, path, refresh_on_expired, |tok| {
-                plug.set_status(tok, sn, index, false)
-            })?;
+            ctx.with_tok(|tok| plug.set_status(tok, sn, index, false))?;
+            emit_json(json, &json_plug_switch(sn, index, false))?;
             if !json {
                 println!("sn={sn} index={index} OFF");
             }
@@ -459,7 +556,7 @@ pub fn run(
         }
         PlugCmd::Logs {
             sn,
-            index: _index,
+            index,
             since,
             until,
             page,
@@ -475,12 +572,12 @@ pub fn run(
                 || until
                     .as_deref()
                     .is_some_and(|u| parse_ago_secs(u).is_none());
-            let tz_min = absolute.then(|| resolve_tz(cfg, tz)).transpose()?;
+            let tz_min = absolute.then(|| resolve_tz(ctx.cfg, ctx.tz)).transpose()?;
             // Rendering timezone: an explicit --tz/config tz always wins;
             // otherwise reuse the offset already resolved for an absolute
             // window (so displayed times match the bounds), else machine local.
-            let display_tz = if tz.is_some() || cfg.tz.is_some() {
-                Some(resolve_tz(cfg, tz)?)
+            let display_tz = if tz.is_some() || ctx.cfg.tz.is_some() {
+                Some(resolve_tz(ctx.cfg, ctx.tz)?)
             } else {
                 tz_min
             };
@@ -506,7 +603,7 @@ pub fn run(
             let mut all: Vec<StatusLog> = Vec::new();
             match page {
                 Some(p) => {
-                    let data = fetch_logs_page(http, cfg, path, refresh_on_expired, &plug, sn, p)?;
+                    let data = fetch_logs_page(&mut ctx, sn, p)?;
                     all.extend(data.logs.into_iter().filter(&keep));
                 }
                 None => {
@@ -514,7 +611,7 @@ pub fn run(
                     // binary-search the first/last page that can intersect the
                     // window (probing ~log2(pages)) and read only that slice,
                     // instead of walking from page 1.
-                    let first = fetch_logs_page(http, cfg, path, refresh_on_expired, &plug, sn, 1)?;
+                    let first = fetch_logs_page(&mut ctx, sn, 1)?;
                     let total = first.totalpage.max(1);
                     let mut cached: Vec<Option<StatusLogsData>> =
                         (0..=total).map(|_| None).collect();
@@ -529,16 +626,7 @@ pub fn run(
                             let mut found = None;
                             while lo <= hi {
                                 let mid = lo + (hi - lo) / 2;
-                                let data = load_logs_page(
-                                    http,
-                                    cfg,
-                                    path,
-                                    refresh_on_expired,
-                                    &plug,
-                                    sn,
-                                    mid,
-                                    &mut cached,
-                                )?;
+                                let data = load_logs_page(&mut ctx, sn, mid, &mut cached)?;
                                 let ok =
                                     logs_page_span(data).is_some_and(|(_, oldest)| oldest <= e);
                                 if ok {
@@ -561,16 +649,7 @@ pub fn run(
                             let mut found = None;
                             while lo <= hi {
                                 let mid = lo + (hi - lo) / 2;
-                                let data = load_logs_page(
-                                    http,
-                                    cfg,
-                                    path,
-                                    refresh_on_expired,
-                                    &plug,
-                                    sn,
-                                    mid,
-                                    &mut cached,
-                                )?;
+                                let data = load_logs_page(&mut ctx, sn, mid, &mut cached)?;
                                 let ok =
                                     logs_page_span(data).is_some_and(|(newest, _)| newest >= s);
                                 if ok {
@@ -590,15 +669,7 @@ pub fn run(
                         for p in lo..=hi {
                             let i = p as usize;
                             if cached[i].is_none() {
-                                cached[i] = Some(fetch_logs_page(
-                                    http,
-                                    cfg,
-                                    path,
-                                    refresh_on_expired,
-                                    &plug,
-                                    sn,
-                                    p,
-                                )?);
+                                cached[i] = Some(fetch_logs_page(&mut ctx, sn, p)?);
                             }
                             if let Some(data) = cached[i].take() {
                                 all.extend(data.logs.into_iter().filter(|l| keep(l)));
@@ -607,6 +678,9 @@ pub fn run(
                     }
                 }
             }
+            // `--index` narrows the result client-side; without it the query
+            // returns everything the API sent (the historical behaviour).
+            let all = filter_logs_by_index(all, index);
             if json {
                 let arr: Vec<serde_json::Value> = all
                     .iter()
@@ -623,32 +697,20 @@ pub fn run(
                     .collect();
                 emit_json(true, &arr)?;
             } else {
-                for l in all {
-                    let state = if l.status == 1 { "ON" } else { "OFF" };
-                    println!(
-                        "{} index={} {} {}",
-                        render_ts(l.createtime, display_tz),
-                        l.index,
-                        state,
-                        l.event
-                    );
+                for line in logs_text_lines(&all, display_tz) {
+                    println!("{line}");
                 }
             }
             Ok(())
         }
-        PlugCmd::Timer { sub } => {
-            do_timer(http, cfg, path, &plug, sub, refresh_on_expired, json, tz)
-        }
-        PlugCmd::Countdown { sub } => {
-            do_countdown(http, cfg, path, &plug, sub, refresh_on_expired, json)
-        }
+        PlugCmd::Timer { sub } => do_timer(&mut ctx, sub),
+        PlugCmd::Countdown { sub } => do_countdown(&mut ctx, sub),
         PlugCmd::Led { sn, state } => {
             let sn = sn.as_deref().context("missing <SN>")?;
             let state = state.as_deref().context("missing <STATE>")?;
             let enabled = parse_on_off(state)?;
-            with_token(http, cfg, path, refresh_on_expired, |tok| {
-                plug.set_led(tok, sn, enabled)
-            })?;
+            ctx.with_tok(|tok| plug.set_led(tok, sn, enabled))?;
+            emit_json(json, &json_led(sn, enabled))?;
             if !json {
                 println!("sn={sn} led {}", if enabled { "ON" } else { "OFF" });
             }
@@ -660,9 +722,8 @@ pub fn run(
             if state != 0 && state != 2 {
                 bail!("power-on-restore state must be 0 (off) or 2 (keep last state), got {state}");
             }
-            with_token(http, cfg, path, refresh_on_expired, |tok| {
-                plug.set_dfltstat(tok, sn, state)
-            })?;
+            ctx.with_tok(|tok| plug.set_dfltstat(tok, sn, state))?;
+            emit_json(json, &json_power_on_restore(sn, state))?;
             if !json {
                 println!("sn={sn} power-on-restore={state}");
             }
@@ -671,23 +732,14 @@ pub fn run(
     }
 }
 
-fn do_timer(
-    http: &HttpClient,
-    cfg: &mut Config,
-    path: &PathBuf,
-    plug: &PlugApi,
-    sub: TimerCmd,
-    refresh_on_expired: bool,
-    json: bool,
-    tz_arg: Option<i64>,
-) -> Result<()> {
+fn do_timer(ctx: &mut Ctx, sub: TimerCmd) -> Result<()> {
+    let plug = ctx.plug;
+    let json = ctx.json;
     match sub {
         TimerCmd::List { sn, index } => {
             let sn = sn.as_deref().context("missing <SN>")?;
-            let tz = resolve_tz(cfg, tz_arg)?;
-            let resp = with_token(http, cfg, path, refresh_on_expired, |tok| {
-                plug.timer_list(tok, sn, index)
-            })?;
+            let tz = resolve_tz(ctx.cfg, ctx.tz)?;
+            let resp = ctx.with_tok(|tok| plug.timer_list(tok, sn, index))?;
             // The plug stores UTC times/weekday bits; present them in local
             // time with a Monday-first weekday mask.
             let rows: Vec<_> = resp
@@ -760,7 +812,7 @@ fn do_timer(
                     "invalid --time '{time}': use a local clock time like 19:25, or minutes of the day 0-1439 (e.g. 480 = 08:00)"
                 )
             })?;
-            let tz = resolve_tz(cfg, tz_arg)?;
+            let tz = resolve_tz(ctx.cfg, ctx.tz)?;
             let timer = PlugTimer {
                 timer_id: None,
                 time: Some(local_to_cloud_time(time, tz)),
@@ -768,9 +820,7 @@ fn do_timer(
                 repeat: Some(local_to_cloud_repeat(repeat, time, tz)),
                 enabled: Some(if disabled { 0 } else { 1 }),
             };
-            let resp = with_token(http, cfg, path, refresh_on_expired, |tok| {
-                plug.timer_add(tok, sn, index, &timer)
-            })?;
+            let resp = ctx.with_tok(|tok| plug.timer_add(tok, sn, index, &timer))?;
             emit_json(json, &resp)?;
             if !json {
                 let id = resp
@@ -792,13 +842,11 @@ fn do_timer(
         TimerCmd::Remove { sn, id, index } => {
             let sn = sn.as_deref().context("missing <SN>")?;
             let id = id.context("missing <ID>")?;
-            let resp = with_token(http, cfg, path, refresh_on_expired, |tok| {
-                plug.timer_list(tok, sn, index)
-            })?;
+            let resp = ctx.with_tok(|tok| plug.timer_list(tok, sn, index))?;
             let found = resp.timer.into_iter().find(|t| t.timer_id == Some(id));
             match found {
                 Some(t) => {
-                    with_token(http, cfg, path, refresh_on_expired, |tok| {
+                    ctx.with_tok(|tok| {
                         plug.timer_del(
                             tok,
                             sn,
@@ -808,126 +856,68 @@ fn do_timer(
                             t.time.unwrap_or(0),
                         )
                     })?;
+                    emit_json(json, &json_timer_removed(sn, index, id))?;
                     if !json {
                         println!("sn={sn} index={index} timer {id} removed");
                     }
                     Ok(())
                 }
-                None => {
-                    emit_json(
-                        json,
-                        &serde_json::json!({ "removed": false, "sn": sn, "timer_id": id }),
-                    )?;
-                    if !json {
-                        bail!("timer {id} not found on sn={sn} index={index}");
-                    }
-                    Ok(())
-                }
+                // Both modes fail the same way: `error: ...` on stderr, exit 1.
+                None => bail!("timer {id} not found on sn={sn} index={index}"),
             }
         }
         TimerCmd::Enable { sn, id, index } => {
             let sn = sn.as_deref().context("missing <SN>")?;
             let id = id.context("missing <ID>")?;
-            set_timer_enabled(
-                http,
-                cfg,
-                path,
-                plug,
-                sn,
-                index,
-                id,
-                true,
-                refresh_on_expired,
-                json,
-            )
+            set_timer_enabled(ctx, sn, index, id, true)
         }
         TimerCmd::Disable { sn, id, index } => {
             let sn = sn.as_deref().context("missing <SN>")?;
             let id = id.context("missing <ID>")?;
-            set_timer_enabled(
-                http,
-                cfg,
-                path,
-                plug,
-                sn,
-                index,
-                id,
-                false,
-                refresh_on_expired,
-                json,
-            )
+            set_timer_enabled(ctx, sn, index, id, false)
         }
     }
 }
 
 /// Toggle a timer's enabled state, keeping its other settings intact.
-#[allow(clippy::too_many_arguments)]
-fn set_timer_enabled(
-    http: &HttpClient,
-    cfg: &mut Config,
-    path: &PathBuf,
-    plug: &PlugApi,
-    sn: &str,
-    index: usize,
-    id: u64,
-    enabled: bool,
-    refresh_on_expired: bool,
-    json: bool,
-) -> Result<()> {
-    let resp = with_token(http, cfg, path, refresh_on_expired, |tok| {
-        plug.timer_list(tok, sn, index)
-    })?;
+fn set_timer_enabled(ctx: &mut Ctx, sn: &str, index: usize, id: u64, enabled: bool) -> Result<()> {
+    let json = ctx.json;
+    let plug = ctx.plug;
+    let resp = ctx.with_tok(|tok| plug.timer_list(tok, sn, index))?;
     let found = resp.timer.into_iter().find(|t| t.timer_id == Some(id));
-    match found {
-        Some(t) => {
-            with_token(http, cfg, path, refresh_on_expired, |tok| {
-                plug.timer_set(
-                    tok,
-                    sn,
-                    index,
-                    id,
-                    enabled,
-                    t.action.unwrap_or(1),
-                    t.repeat.unwrap_or(0),
-                    t.time.unwrap_or(0),
-                )
-            })?;
-            emit_json(
-                json,
-                &serde_json::json!({ "sn": sn, "index": index, "timer_id": id, "enabled": enabled }),
-            )?;
-            if !json {
-                println!(
-                    "sn={sn} index={index} timer {id} {}",
-                    if enabled { "enabled" } else { "disabled" }
-                );
-            }
-            Ok(())
-        }
-        None => {
-            if !json {
-                bail!("timer {id} not found on sn={sn} index={index}");
-            }
-            Ok(())
-        }
+    let Some(t) = found else {
+        // Both modes fail the same way: `error: ...` on stderr, exit 1.
+        bail!("timer {id} not found on sn={sn} index={index}");
+    };
+    ctx.with_tok(|tok| {
+        plug.timer_set(
+            tok,
+            sn,
+            index,
+            id,
+            enabled,
+            t.action.unwrap_or(1),
+            t.repeat.unwrap_or(0),
+            t.time.unwrap_or(0),
+        )
+    })?;
+    emit_json(json, &json_timer_enabled(sn, index, id, enabled))?;
+    if !json {
+        println!(
+            "sn={sn} index={index} timer {id} {}",
+            if enabled { "enabled" } else { "disabled" }
+        );
     }
+    Ok(())
 }
 
-fn do_countdown(
-    http: &HttpClient,
-    cfg: &mut Config,
-    path: &PathBuf,
-    plug: &PlugApi,
-    sub: CountdownCmd,
-    refresh_on_expired: bool,
-    json: bool,
-) -> Result<()> {
+fn do_countdown(ctx: &mut Ctx, sub: CountdownCmd) -> Result<()> {
+    let plug = ctx.plug;
+    let json = ctx.json;
     match sub {
         CountdownCmd::Status { sn, index } => {
             let sn = sn.as_deref().context("missing <SN>")?;
-            let resp = with_token(http, cfg, path, refresh_on_expired, |tok| {
-                plug.cntdown_get(tok, sn, index)
-            })?;
+            let resp = ctx.with_tok(|tok| plug.cntdown_get(tok, sn, index))?;
             emit_json(json, &resp)?;
             if !json {
                 match resp.remain {
@@ -955,9 +945,8 @@ fn do_countdown(
             if count == 0 {
                 bail!("countdown count must be > 0 seconds");
             }
-            with_token(http, cfg, path, refresh_on_expired, |tok| {
-                plug.cntdown_start(tok, sn, index, action, count)
-            })?;
+            ctx.with_tok(|tok| plug.cntdown_start(tok, sn, index, action, count))?;
+            emit_json(json, &json_countdown_start(sn, index, count, action))?;
             if !json {
                 println!(
                     "sn={sn} index={index} countdown started: {count}s -> {}",
@@ -968,9 +957,8 @@ fn do_countdown(
         }
         CountdownCmd::Stop { sn, index } => {
             let sn = sn.as_deref().context("missing <SN>")?;
-            with_token(http, cfg, path, refresh_on_expired, |tok| {
-                plug.cntdown_stop(tok, sn, index)
-            })?;
+            ctx.with_tok(|tok| plug.cntdown_stop(tok, sn, index))?;
+            emit_json(json, &json_countdown_stop(sn, index))?;
             if !json {
                 println!("sn={sn} index={index} countdown stopped");
             }
@@ -1042,5 +1030,126 @@ mod tests {
         assert_eq!(mask_days(0), "只一次");
         assert_eq!(mask_days(31), "周一周二周三周四周五");
         assert_eq!(mask_days(79), "周一周二周三周四周日");
+    }
+
+    /// A synthetic log entry for the `--index` filter / text-render tests.
+    fn log(index: i32) -> StatusLog {
+        StatusLog {
+            event: "on".to_string(),
+            status: 1,
+            index,
+            // 2026-09-02 01:56:44 UTC
+            createtime: 1_788_314_204,
+            createtime_format: "2026-09-02 09:56:44".to_string(),
+        }
+    }
+
+    #[test]
+    fn logs_index_filter_without_index_keeps_everything() {
+        let out = filter_logs_by_index(vec![log(0), log(1), log(0)], None);
+        let kept: Vec<i32> = out.iter().map(|l| l.index).collect();
+        assert_eq!(kept, vec![0, 1, 0]);
+    }
+
+    #[test]
+    fn logs_index_filter_selects_one_port() {
+        let out = filter_logs_by_index(vec![log(0), log(1), log(0)], Some(1));
+        let kept: Vec<i32> = out.iter().map(|l| l.index).collect();
+        assert_eq!(kept, vec![1]);
+    }
+
+    #[test]
+    fn logs_index_filter_without_match_is_empty() {
+        assert!(filter_logs_by_index(vec![log(0)], Some(2)).is_empty());
+        assert!(filter_logs_by_index(Vec::<StatusLog>::new(), Some(0)).is_empty());
+    }
+
+    #[test]
+    fn logs_text_empty_result_gets_a_notice() {
+        // The empty branch of the filtering: what a query that matched
+        // nothing must print instead of staying silent.
+        let empty = filter_logs_by_index(vec![log(0)], Some(9));
+        assert_eq!(logs_text_lines(&empty, Some(0)), vec!["no matching events"]);
+        assert_eq!(logs_text_lines(&[], None), vec!["no matching events"]);
+    }
+
+    #[test]
+    fn logs_text_renders_each_entry() {
+        let lines = logs_text_lines(&[log(0), log(1)], Some(0));
+        assert_eq!(
+            lines,
+            vec![
+                "2026-09-02 01:56:44 UTC+00:00 index=0 ON on",
+                "2026-09-02 01:56:44 UTC+00:00 index=1 ON on",
+            ]
+        );
+    }
+
+    #[test]
+    fn json_shape_plug_switch_led_and_restore() {
+        assert_eq!(
+            serde_json::to_value(json_plug_switch("SN1", 2, true)).unwrap(),
+            serde_json::json!({ "ok": true, "sn": "SN1", "index": 2, "status": "on" })
+        );
+        assert_eq!(
+            serde_json::to_value(json_plug_switch("SN1", 2, false)).unwrap(),
+            serde_json::json!({ "ok": true, "sn": "SN1", "index": 2, "status": "off" })
+        );
+        assert_eq!(
+            serde_json::to_value(json_led("SN1", true)).unwrap(),
+            serde_json::json!({ "ok": true, "sn": "SN1", "led": "on" })
+        );
+        assert_eq!(
+            serde_json::to_value(json_led("SN1", false)).unwrap(),
+            serde_json::json!({ "ok": true, "sn": "SN1", "led": "off" })
+        );
+        assert_eq!(
+            serde_json::to_value(json_power_on_restore("SN1", 0)).unwrap(),
+            serde_json::json!({ "ok": true, "sn": "SN1", "state": 0 })
+        );
+        assert_eq!(
+            serde_json::to_value(json_power_on_restore("SN1", 2)).unwrap(),
+            serde_json::json!({ "ok": true, "sn": "SN1", "state": 2 })
+        );
+    }
+
+    #[test]
+    fn json_shape_countdown_start_and_stop() {
+        assert_eq!(
+            serde_json::to_value(json_countdown_start("SN1", 0, 600, 1)).unwrap(),
+            serde_json::json!({
+                "ok": true, "sn": "SN1", "index": 0, "count": 600, "action": 1
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(json_countdown_start("SN1", 0, 30, 0)).unwrap(),
+            serde_json::json!({
+                "ok": true, "sn": "SN1", "index": 0, "count": 30, "action": 0
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(json_countdown_stop("SN1", 0)).unwrap(),
+            serde_json::json!({ "ok": true, "sn": "SN1", "index": 0 })
+        );
+    }
+
+    #[test]
+    fn json_shape_timer_remove_and_enable_disable() {
+        assert_eq!(
+            serde_json::to_value(json_timer_removed("SN1", 0, 7)).unwrap(),
+            serde_json::json!({ "ok": true, "sn": "SN1", "index": 0, "timer_id": 7 })
+        );
+        assert_eq!(
+            serde_json::to_value(json_timer_enabled("SN1", 0, 7, true)).unwrap(),
+            serde_json::json!({
+                "ok": true, "sn": "SN1", "index": 0, "timer_id": 7, "enabled": true
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(json_timer_enabled("SN1", 0, 7, false)).unwrap(),
+            serde_json::json!({
+                "ok": true, "sn": "SN1", "index": 0, "timer_id": 7, "enabled": false
+            })
+        );
     }
 }

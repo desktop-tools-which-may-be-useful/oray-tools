@@ -2,6 +2,18 @@
 //!
 //! Device listing/info/rename/memo live here; smart-plug controls live in the
 //! [`plug`] submodule.
+//!
+//! # `--json` output contract
+//!
+//! - With `--json`, every command prints **exactly one** JSON value on stdout
+//!   and only when it succeeds: an object (`rename`, `memo`) or one of the
+//!   shapes that already existed and stay untouched (`list`, `info`, plus
+//!   everything the [`plug`] submodule emits).
+//! - A failure always `bail!`s: main.rs prints `error: ...` on stderr and
+//!   exits 1, identically in JSON and text mode. No branch swallows an error
+//!   just because `--json` was passed, and no success path prints an empty
+//!   stdout in JSON mode.
+//! - Text-mode output is unchanged.
 
 pub mod plug;
 
@@ -47,6 +59,17 @@ pub enum WakeupCmd {
 
 /// The prompt label shared by every `<SN>` argument.
 pub(crate) const SN_LABEL: &str = "Device serial number (SN)";
+
+/// `--json` body of `wakeup rename` (module docs carry the contract). Kept as
+/// a builder so the shape is unit-testable without a network round trip.
+fn json_renamed(sn: &str, name: &str) -> serde_json::Value {
+    serde_json::json!({ "ok": true, "sn": sn, "name": name })
+}
+
+/// `--json` body of `wakeup memo`.
+fn json_memo(sn: &str, memo: &str) -> serde_json::Value {
+    serde_json::json!({ "ok": true, "sn": sn, "memo": memo })
+}
 
 /// `--interactive`: type the arguments this command line left out.
 pub fn fill(cmd: &mut WakeupCmd) -> Result<()> {
@@ -127,6 +150,7 @@ pub fn run(
             with_token(http, cfg, path, refresh_on_expired, |tok| {
                 plug.rename_device(tok, sn, new_name, description)
             })?;
+            emit_json(json, &json_renamed(sn, new_name))?;
             if !json {
                 println!("renamed {sn} to '{new_name}'");
             }
@@ -141,6 +165,7 @@ pub fn run(
             with_token(http, cfg, path, refresh_on_expired, |tok| {
                 plug.rename_device(tok, sn, &device.name, new_memo)
             })?;
+            emit_json(json, &json_memo(sn, new_memo))?;
             if !json {
                 println!("memo of {sn} set to '{new_memo}'");
             }
@@ -169,5 +194,32 @@ fn print_wakeup_device(d: &WakeupDevice, json: bool) {
     }
     if !d.remote_ids.is_empty() {
         println!("remote_ids:  {:?}", d.remote_ids);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The serialized body (the exact value `emit_json` prints) of a
+    /// constructed JSON value.
+    fn body(v: serde_json::Value) -> serde_json::Value {
+        serde_json::to_value(&v).expect("JSON body serializes")
+    }
+
+    #[test]
+    fn json_shape_rename() {
+        assert_eq!(
+            body(json_renamed("100000000001", "desk plug")),
+            serde_json::json!({ "ok": true, "sn": "100000000001", "name": "desk plug" })
+        );
+    }
+
+    #[test]
+    fn json_shape_memo() {
+        assert_eq!(
+            body(json_memo("100000000001", "阳台")),
+            serde_json::json!({ "ok": true, "sn": "100000000001", "memo": "阳台" })
+        );
     }
 }

@@ -2,6 +2,18 @@
 //!
 //! Only one module: the remote API has a single client and the commands are
 //! thin, so everything lives in this `mod.rs`.
+//!
+//! # `--json` output contract
+//!
+//! - With `--json`, every command prints **exactly one** JSON value on stdout
+//!   and only when it succeeds: an object (`rename`, `memo`) or one of the
+//!   shapes that already existed and stay untouched (`list`, `info`,
+//!   `status`).
+//! - A failure always `bail!`s: main.rs prints `error: ...` on stderr and
+//!   exits 1, identically in JSON and text mode. No branch swallows an error
+//!   just because `--json` was passed, and no success path prints an empty
+//!   stdout in JSON mode.
+//! - Text-mode output is unchanged.
 
 use crate::config::Config;
 use crate::prompt;
@@ -40,6 +52,17 @@ pub enum RemoteCmd {
         /// New memo text
         new_memo: Option<String>,
     },
+}
+
+/// `--json` body of `remote rename` (module docs carry the contract). Kept as
+/// a builder so the shape is unit-testable without a network round trip.
+fn json_renamed(id: u64, name: &str) -> serde_json::Value {
+    serde_json::json!({ "ok": true, "id": id, "name": name })
+}
+
+/// `--json` body of `remote memo`.
+fn json_memo(id: u64, memo: &str) -> serde_json::Value {
+    serde_json::json!({ "ok": true, "id": id, "memo": memo })
 }
 
 /// `--interactive`: type the arguments this command line left out.
@@ -192,6 +215,7 @@ pub fn run(
                     &RemoteUpdate::new(new_name, &current.info.description),
                 )
             })?;
+            emit_json(json, &json_renamed(id, new_name))?;
             if !json {
                 println!("renamed remote {id} to '{new_name}'");
             }
@@ -204,10 +228,38 @@ pub fn run(
             with_token(http, cfg, path, refresh_on_expired, |tok| {
                 api.update(tok, id, &RemoteUpdate::new(&current.info.name, new_memo))
             })?;
+            emit_json(json, &json_memo(id, new_memo))?;
             if !json {
                 println!("memo of remote {id} set to '{new_memo}'");
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The serialized body (the exact value `emit_json` prints) of a
+    /// constructed JSON value.
+    fn body(v: serde_json::Value) -> serde_json::Value {
+        serde_json::to_value(&v).expect("JSON body serializes")
+    }
+
+    #[test]
+    fn json_shape_rename() {
+        assert_eq!(
+            body(json_renamed(42, "workstation")),
+            serde_json::json!({ "ok": true, "id": 42, "name": "workstation" })
+        );
+    }
+
+    #[test]
+    fn json_shape_memo() {
+        assert_eq!(
+            body(json_memo(42, "办公桌")),
+            serde_json::json!({ "ok": true, "id": 42, "memo": "办公桌" })
+        );
     }
 }
