@@ -3,6 +3,9 @@
 *.har
 /tmp
 
+# Per-task git worktrees created by the agent team for this change set.
+/.worktrees/
+
 # Local auth material: account name, password hash, tokens, client id.
 # Only Cargo.toml belongs at the repository root — every other root-level
 # toml (config.toml, 1.toml, ...) is a local config dump and must not be
