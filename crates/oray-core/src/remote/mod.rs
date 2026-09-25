@@ -180,6 +180,9 @@ impl RemoteApi {
         }
     }
 
+    /// Execute one request with the shared api-std headers, requiring `2xx`
+    /// (see [`trace::expect_2xx`]) and returning the trace plus the body.
+    /// `content_type` is appended when the request carries a body.
     fn send(
         &self,
         token: &str,
@@ -187,14 +190,12 @@ impl RemoteApi {
         method: &'static str,
         url: &str,
         body: Option<String>,
+        content_type: Option<&'static str>,
     ) -> RawResult<(Vec<RequestLog>, String)> {
-        let headers = vec![
-            ("Authorization".into(), format!("Bearer {token}")),
-            ("Accept".into(), "application/json".into()),
-            ("User-Agent".into(), crate::USER_AGENT.into()),
-            ("X-Channel".into(), "OPPO".into()),
-            ("Country-Region".into(), "CN".into()),
-        ];
+        let mut headers = trace::api_headers(token);
+        if let Some(content_type) = content_type {
+            headers.push(("Content-Type".into(), content_type.into()));
+        }
         let ex = trace::execute(
             &self.client,
             trace::Request {
@@ -204,17 +205,7 @@ impl RemoteApi {
                 body,
             },
         )?;
-        if !(200..300).contains(&ex.status) {
-            return Err(TracedError {
-                error: Error::HttpStatus {
-                    what,
-                    status: ex.status,
-                    body: ex.text,
-                },
-                calls: vec![ex.log],
-            });
-        }
-        Ok((vec![ex.log], ex.text))
+        trace::expect_2xx(ex, what)
     }
 
     /// List remote devices (same query shape the Oray app uses).
@@ -223,7 +214,7 @@ impl RemoteApi {
             "{}/remotes?offset={offset}&limit={limit}&version=v2&new_server=1",
             self.api_base
         );
-        let (calls, text) = self.send(token, "list remotes", "GET", &url, None)?;
+        let (calls, text) = self.send(token, "list remotes", "GET", &url, None, None)?;
         trace::finish(
             calls,
             serde_json::from_str(&text).map_err(|e| Error::bad_body(text, e)),
@@ -231,21 +222,26 @@ impl RemoteApi {
     }
 
     /// Look up a single remote by id from the live list.
+    ///
+    /// This is a **list + find**, not a lookup by id: the endpoint set has no
+    /// "get remote by id" call, so the whole account list is fetched first
+    /// (capped at 10 000 remotes, `list(token, 0, 10_000)`) and scanned in
+    /// memory. A miss therefore means "not among the first 10 000 remotes
+    /// listed", which is what the error message reports.
     pub fn find(&self, token: &str, remote_id: u64) -> TracedResult<Remote> {
         let all = self.list(token, 0, 10_000)?;
         let calls = all.calls;
-        match all
-            .data
-            .remotes
-            .into_iter()
-            .find(|r| r.remote_id == remote_id)
-        {
+        let remotes = all.data.remotes;
+        let scanned = remotes.len();
+        match remotes.into_iter().find(|r| r.remote_id == remote_id) {
             Some(remote) => Ok(Traced {
                 data: remote,
                 calls,
             }),
             None => Err(TracedError {
-                error: Error::Api(format!("remote {remote_id} not found")),
+                error: Error::Api(format!(
+                    "remote {remote_id} not found among {scanned} remotes listed"
+                )),
                 calls,
             }),
         }
@@ -257,7 +253,7 @@ impl RemoteApi {
             "{}/console/remotes/{remote_id}?with_powerplan=true&with_extend=true&new_server=1",
             self.api_base
         );
-        let (calls, text) = self.send(token, "get remote detail", "GET", &url, None)?;
+        let (calls, text) = self.send(token, "get remote detail", "GET", &url, None, None)?;
         match serde_json::from_str::<ConsoleResponse>(&text).map_err(|e| Error::bad_body(text, e)) {
             Ok(parsed) => Ok(Traced {
                 data: parsed.remote,
@@ -277,36 +273,17 @@ impl RemoteApi {
         let url = format!("{}/remotes/{remote_id}/info", self.api_base);
         let body = serde_json::to_string(update)
             .map_err(|e| Error::Api(format!("serialize update payload: {e}")))?;
-        let headers = vec![
-            ("Authorization".into(), format!("Bearer {token}")),
-            ("Accept".into(), "application/json".into()),
-            ("User-Agent".into(), crate::USER_AGENT.into()),
-            ("X-Channel".into(), "OPPO".into()),
-            ("Country-Region".into(), "CN".into()),
-            ("Content-Type".into(), "application/json".into()),
-        ];
-        let ex = trace::execute(
-            &self.client,
-            trace::Request {
-                method: "PATCH",
-                url,
-                headers,
-                body: Some(body),
-            },
+        let (calls, text) = self.send(
+            token,
+            "update remote",
+            "PATCH",
+            &url,
+            Some(body),
+            Some("application/json"),
         )?;
-        if !(200..300).contains(&ex.status) {
-            return Err(TracedError {
-                error: Error::HttpStatus {
-                    what: "update remote",
-                    status: ex.status,
-                    body: ex.text,
-                },
-                calls: vec![ex.log],
-            });
-        }
         trace::finish(
-            vec![ex.log],
-            serde_json::from_str(&ex.text).map_err(|e| Error::bad_body(ex.text, e)),
+            calls,
+            serde_json::from_str(&text).map_err(|e| Error::bad_body(text, e)),
         )
     }
 }
