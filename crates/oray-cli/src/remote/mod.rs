@@ -21,16 +21,24 @@
 use crate::config::Config;
 use crate::prompt;
 use crate::support::{emit_json, with_token};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Subcommand;
-use oray_core::remote::{RemoteApi, RemoteUpdate};
+use oray_core::remote::{REMOTE_PAGE_LIMIT, RemoteApi, RemoteUpdate, RemotesResponse};
 use reqwest::blocking::Client as HttpClient;
 use std::path::PathBuf;
 
 #[derive(Subcommand)]
 pub enum RemoteCmd {
-    /// List remote devices
-    List,
+    /// List remote devices (paged server-side: `--offset`/`--limit`)
+    List {
+        /// First remote of the page to fetch
+        #[arg(long, default_value_t = 0, display_order = 0)]
+        offset: u64,
+        /// Remotes per request (the endpoint's own cap is 10000; a bigger
+        /// value is clamped server-side and reported on stderr)
+        #[arg(long, default_value_t = REMOTE_PAGE_LIMIT, display_order = 0)]
+        limit: u64,
+    },
     /// Show extended detail for one remote (by remote id)
     Info {
         /// Remote device id
@@ -68,6 +76,36 @@ fn json_memo(id: u64, memo: &str) -> serde_json::Value {
     serde_json::json!({ "ok": true, "id": id, "memo": memo })
 }
 
+/// Post-hoc page warnings for `remote list`, printed on **stderr** so the
+/// `--json` contract (exactly one value on stdout) stays intact.
+///
+/// Both signals come from the response, because that is where they live: the
+/// server's own `page_size_limit` — a request cannot be capped before it is
+/// sent, the cap arrives with the answer — and `total`, which is what
+/// actually tells the caller a page is not the end of the list.
+fn page_warnings(offset: u64, limit: u64, resp: &RemotesResponse) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if let Some(cap) = resp.page_size_limit
+        && limit > cap
+    {
+        warnings.push(format!(
+            "warning: --limit {limit} exceeds the server's page size limit {cap}; this \
+             response holds at most {cap} remotes"
+        ));
+    }
+    if let Some(total) = resp.total {
+        let shown = resp.remotes.len() as u64;
+        if offset.saturating_add(shown) < total {
+            warnings.push(format!(
+                "warning: showing {shown} of {total} remotes (offset {offset}); fetch the rest \
+                 with `oray-tools remote list --offset {}`",
+                offset + shown
+            ));
+        }
+    }
+    warnings
+}
+
 /// `--interactive`: type the arguments this command line left out.
 ///
 /// A no-op unless the flag is set (defense in depth on top of clap's strict
@@ -78,7 +116,8 @@ pub fn fill(cmd: &mut RemoteCmd, interactive: bool) -> Result<()> {
         return Ok(());
     }
     match cmd {
-        RemoteCmd::List => Ok(()),
+        // `--offset`/`--limit` both default, so nothing is left to ask for.
+        RemoteCmd::List { .. } => Ok(()),
         RemoteCmd::Info { id } => {
             prompt::require_terminal(&[("<ID>", id.is_none())], "oray-tools remote info <id>")?;
             prompt::fill_parsed(id, "Remote id")
@@ -117,10 +156,20 @@ pub fn run(
     let server = cfg.server();
     let api = RemoteApi::new(http.clone(), &server.api_base);
     match sub {
-        RemoteCmd::List => {
+        RemoteCmd::List { offset, limit } => {
+            // A zero limit is not a page size (the server would answer with
+            // the whole list), so refuse it before spending a token round trip.
+            if limit == 0 {
+                bail!("--limit must be at least 1");
+            }
             let resp = with_token(http, cfg, path, refresh_on_expired, |tok| {
-                api.list(tok, 0, 10_000)
+                api.list(tok, offset, limit)
             })?;
+            // After the fact, because that is when the response knows: server
+            // cap, and whether more pages follow. stderr, never stdout.
+            for warning in page_warnings(offset, limit, &resp) {
+                eprintln!("{warning}");
+            }
             emit_json(json, &resp)?;
             if !json {
                 for r in &resp.remotes {
@@ -284,5 +333,44 @@ mod tests {
             body(json_memo(42, "办公桌")),
             serde_json::json!({ "ok": true, "id": 42, "memo": "办公桌" })
         );
+    }
+
+    /// A page that stops short of `total`, and a `--limit` above the
+    /// server's own cap: the two things the response can prove, and the only
+    /// two things worth a stderr line.
+    #[test]
+    fn page_warnings_report_cap_and_remainder() {
+        let resp: RemotesResponse = serde_json::from_str(
+            r#"{"remotes":[{"remote_id":800001},{"remote_id":800002}],"total":5,"page_size_limit":10000}"#,
+        )
+        .unwrap();
+        let warnings = page_warnings(0, 20_000, &resp);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0].contains("--limit 20000 exceeds the server's page size limit 10000"),
+            "{}",
+            warnings[0]
+        );
+        assert!(
+            warnings[1].contains("showing 2 of 5 remotes"),
+            "{}",
+            warnings[1]
+        );
+        assert!(warnings[1].contains("--offset 2"), "{}", warnings[1]);
+    }
+
+    /// Inside the cap and covering `total` — or no metadata at all — there is
+    /// nothing to say, so `--json` consumers never see a stray line.
+    #[test]
+    fn page_warnings_stay_quiet_on_a_complete_page() {
+        let complete: RemotesResponse = serde_json::from_str(
+            r#"{"remotes":[{"remote_id":800001}],"total":1,"page_size_limit":10000}"#,
+        )
+        .unwrap();
+        assert!(page_warnings(0, REMOTE_PAGE_LIMIT, &complete).is_empty());
+
+        let bare: RemotesResponse =
+            serde_json::from_str(r#"{"remotes":[{"remote_id":800001}]}"#).unwrap();
+        assert!(page_warnings(0, REMOTE_PAGE_LIMIT, &bare).is_empty());
     }
 }

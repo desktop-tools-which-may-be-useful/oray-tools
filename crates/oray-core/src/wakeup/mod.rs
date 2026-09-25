@@ -80,27 +80,51 @@ pub struct WakeupDevicesResponse {
     pub devices: Vec<WakeupDevice>,
 }
 
-/// The page cap of `/wakeup/devices`: `list` only ever asks for the first
-/// page (`offset=0&limit=<here>`), so this is also the number of devices
-/// [`WakeupApi::find`] can scan — both the URL and the "not found" message
-/// are derived from it so they cannot drift apart.
-const DEVICE_LIST_LIMIT: usize = 100;
+/// The default page size of `/wakeup/devices`: `offset=0&limit=100` is what
+/// the official client sends (captured), so this is both the CLI's
+/// `wakeup list --limit` default and the number of devices
+/// [`WakeupApi::find`] scans — the URL and the "not found" message are
+/// derived from it so they cannot drift apart.
+pub const DEVICE_LIST_LIMIT: usize = 100;
 
-/// Build `GET {api_base}/wakeup/devices?offset=0&limit=100[&sn=...]`, with
-/// every query value percent-encoded the way
+/// The largest page this client will ever request from `/wakeup/devices`.
+///
+/// Unlike `GET /remotes`, this endpoint reports **no** pagination metadata
+/// (the body is just `{"devices":[…]}` — no `total`, no `page_size_limit`),
+/// so neither a server-side clamp nor a truncated page can be detected after
+/// the fact. The request itself is bounded here instead of trusting an
+/// unknown cap. What is known, from probing a live account: `offset` is
+/// honoured (`offset>=1` on a one-device account answers an empty page),
+/// `limit=0` answers the full list and a negative `limit` is rejected.
+pub const DEVICE_LIST_MAX_LIMIT: usize = 10_000;
+
+/// The page size actually requested for a caller-supplied `limit`: `0` means
+/// "the default" and anything past [`DEVICE_LIST_MAX_LIMIT`] is capped.
+/// `list` and the CLI's `--limit` warning both go through this one rule, so
+/// they cannot disagree about what was sent.
+pub fn effective_device_limit(limit: usize) -> usize {
+    if limit == 0 {
+        DEVICE_LIST_LIMIT
+    } else {
+        limit.min(DEVICE_LIST_MAX_LIMIT)
+    }
+}
+
+/// Build `GET {api_base}/wakeup/devices?offset={offset}&limit={limit}[&sn=…]`,
+/// with every query value percent-encoded the way
 /// `application/x-www-form-urlencoded` requires (space -> `+`; `&`, `+` and
 /// non-ASCII escaped). A plain `format!` splice would let an `sn` containing
 /// `&` inject extra query parameters — and would disagree with the encoded
 /// URLs the plug endpoints already build.
-fn device_list_url(api_base: &str, sn: Option<&str>) -> Result<String> {
+fn device_list_url(api_base: &str, offset: u64, limit: usize, sn: Option<&str>) -> Result<String> {
     let base = format!("{api_base}/wakeup/devices");
     let mut url =
         reqwest::Url::parse(&base).map_err(|e| Error::Api(format!("invalid api base: {e}")))?;
     {
         let mut query = url.query_pairs_mut();
         query
-            .append_pair("offset", "0")
-            .append_pair("limit", &DEVICE_LIST_LIMIT.to_string());
+            .append_pair("offset", &offset.to_string())
+            .append_pair("limit", &effective_device_limit(limit).to_string());
         if let Some(sn) = sn {
             query.append_pair("sn", sn);
         }
@@ -109,10 +133,11 @@ fn device_list_url(api_base: &str, sn: Option<&str>) -> Result<String> {
 }
 
 /// The URL [`WakeupApi::find`] lists with: the server-side `sn` filter
-/// always present, so a find never downloads an unrelated page. Kept as the
-/// single place `find` builds its query so tests can pin the `sn=` pair.
+/// always present, so a find never downloads an unrelated page, on the
+/// default page (`offset=0`, [`DEVICE_LIST_LIMIT`]). Kept as the single
+/// place `find` builds its query so tests can pin the `sn=` pair.
 fn find_list_url(api_base: &str, sn: &str) -> Result<String> {
-    device_list_url(api_base, Some(sn))
+    device_list_url(api_base, 0, DEVICE_LIST_LIMIT, Some(sn))
 }
 
 /// The "not found" message of [`WakeupApi::find`], stating how many devices
@@ -155,15 +180,25 @@ impl WakeupApi {
         trace::expect_2xx(ex, what)
     }
 
-    /// List wakeup devices. Optionally filter to one SN
-    /// (`/wakeup/devices?sn=<sn>`); the SN is percent-encoded.
+    /// List wakeup devices, one page at a time: `offset` selects the page
+    /// (the endpoint honours it — an `offset` past the end answers an empty
+    /// page) and `limit` is its size, with `0` meaning [`DEVICE_LIST_LIMIT`]
+    /// and anything larger capped by [`effective_device_limit`]. Optionally
+    /// filter to one SN (`/wakeup/devices?sn=<sn>`); the SN is
+    /// percent-encoded.
     ///
-    /// Only the **first page** is fetched (`offset=0`, `limit` being the
-    /// [`DEVICE_LIST_LIMIT`] constant, 100): accounts with more devices see
-    /// just that first hundred, which is also all [`find`](Self::find) can
-    /// scan.
-    pub fn list(&self, token: &str, sn: Option<&str>) -> TracedResult<WakeupDevicesResponse> {
-        let url = device_list_url(&self.api_base, sn)?;
+    /// The response carries no `total`, so a full page
+    /// (`devices.len() == effective_device_limit(limit)`) cannot say whether
+    /// more devices follow — the CLI warns about that instead of implying
+    /// the page is the whole account.
+    pub fn list(
+        &self,
+        token: &str,
+        offset: u64,
+        limit: usize,
+        sn: Option<&str>,
+    ) -> TracedResult<WakeupDevicesResponse> {
+        let url = device_list_url(&self.api_base, offset, limit, sn)?;
         self.list_at(token, &url)
     }
 
@@ -240,24 +275,66 @@ mod tests {
     #[test]
     fn device_list_url_plain_sn_matches_legacy_format() {
         assert_eq!(
-            device_list_url("https://api-std.sunlogin.oray.com", None).unwrap(),
+            device_list_url(
+                "https://api-std.sunlogin.oray.com",
+                0,
+                DEVICE_LIST_LIMIT,
+                None
+            )
+            .unwrap(),
             "https://api-std.sunlogin.oray.com/wakeup/devices?offset=0&limit=100"
         );
         assert_eq!(
-            device_list_url("https://api-std.sunlogin.oray.com", Some("100000000001")).unwrap(),
+            device_list_url(
+                "https://api-std.sunlogin.oray.com",
+                0,
+                DEVICE_LIST_LIMIT,
+                Some("100000000001")
+            )
+            .unwrap(),
             "https://api-std.sunlogin.oray.com/wakeup/devices?offset=0&limit=100&sn=100000000001"
         );
         // Trailing slash on the base is trimmed by `WakeupApi::new` already;
         // a URL-safe sn with dashes/underscores/dots also stays verbatim.
         assert_eq!(
-            device_list_url("https://example.invalid", Some("AB_cd-1.2")).unwrap(),
+            device_list_url(
+                "https://example.invalid",
+                0,
+                DEVICE_LIST_LIMIT,
+                Some("AB_cd-1.2")
+            )
+            .unwrap(),
             "https://example.invalid/wakeup/devices?offset=0&limit=100&sn=AB_cd-1.2"
+        );
+    }
+
+    /// `offset` and `limit` reach the query verbatim, `limit=0` means "the
+    /// default" and a limit past the client-side max is capped — the
+    /// endpoint publishes no `page_size_limit`, so the request bounds itself.
+    #[test]
+    fn device_list_url_carries_offset_and_limits() {
+        assert_eq!(
+            device_list_url("https://example.invalid", 200, 50, None).unwrap(),
+            "https://example.invalid/wakeup/devices?offset=200&limit=50"
+        );
+        assert_eq!(
+            device_list_url("https://example.invalid", 0, 0, None).unwrap(),
+            "https://example.invalid/wakeup/devices?offset=0&limit=100"
+        );
+        assert_eq!(effective_device_limit(0), DEVICE_LIST_LIMIT);
+        assert_eq!(effective_device_limit(50), 50);
+        assert_eq!(effective_device_limit(usize::MAX), DEVICE_LIST_MAX_LIMIT);
+        assert_eq!(DEVICE_LIST_MAX_LIMIT, 10_000);
+        assert_eq!(
+            device_list_url("https://example.invalid", 0, usize::MAX, None).unwrap(),
+            "https://example.invalid/wakeup/devices?offset=0&limit=10000"
         );
     }
 
     #[test]
     fn device_list_url_encodes_special_sn() {
-        let space = device_list_url("https://example.invalid", Some("a b")).unwrap();
+        let space =
+            device_list_url("https://example.invalid", 0, DEVICE_LIST_LIMIT, Some("a b")).unwrap();
         assert_eq!(
             space,
             "https://example.invalid/wakeup/devices?offset=0&limit=100&sn=a+b"
@@ -265,7 +342,13 @@ mod tests {
 
         // `&` must not split the query, `+` must not decode to a space,
         // non-ASCII must be UTF-8 percent-encoded.
-        let weird = device_list_url("https://example.invalid", Some("a&b+c中文")).unwrap();
+        let weird = device_list_url(
+            "https://example.invalid",
+            0,
+            DEVICE_LIST_LIMIT,
+            Some("a&b+c中文"),
+        )
+        .unwrap();
         assert!(!weird.contains(' '));
         assert!(weird.ends_with("&sn=a%26b%2Bc%E4%B8%AD%E6%96%87"));
         // Exactly one `sn=` pair, so nothing got injected as a new parameter.

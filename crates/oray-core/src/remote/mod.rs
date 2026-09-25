@@ -102,8 +102,22 @@ impl RemoteState {
     }
 }
 
+/// The page size this client asks `GET /remotes` for, and the default of the
+/// CLI's `remote list --limit`.
+///
+/// It mirrors the endpoint's own `page_size_limit` (observed as 10 000 in
+/// every response), so a bigger request can only be clamped server-side.
+/// [`RemoteApi::find`] and `remote list` both derive their default from this
+/// constant, which is why neither carries a literal `10_000` any more.
+pub const REMOTE_PAGE_LIMIT: u64 = 10_000;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RemotesResponse {
+    /// The page itself. `#[serde(default)]` because the endpoint **omits the
+    /// key entirely** when the page is empty — `offset >= total` answers
+    /// `{"total":1,"page_size_limit":10000}` — and a required field would
+    /// surface that as a parse error instead of an empty list.
+    #[serde(default)]
     pub remotes: Vec<Remote>,
     #[serde(default)]
     pub total: Option<u64>,
@@ -170,6 +184,13 @@ impl<'a> RemoteUpdate<'a> {
     }
 }
 
+/// `GET {api_base}/remotes?offset={offset}&limit={limit}&version=v2&new_server=1`
+/// — the query shape the Oray app sends, kept in one place so the URL is
+/// unit-testable and `offset`/`limit` cannot drift between callers.
+fn remotes_list_url(api_base: &str, offset: u64, limit: u64) -> String {
+    format!("{api_base}/remotes?offset={offset}&limit={limit}&version=v2&new_server=1")
+}
+
 impl RemoteApi {
     /// Wrap an injected client for the API base
     /// (e.g. `https://api-std.sunlogin.oray.com`).
@@ -209,11 +230,14 @@ impl RemoteApi {
     }
 
     /// List remote devices (same query shape the Oray app uses).
+    ///
+    /// Both halves of the query are caller-controlled: `offset` selects the
+    /// page (the endpoint honours it — an `offset` past `total` answers an
+    /// empty page) and `limit` is its size. Ask for at most
+    /// [`REMOTE_PAGE_LIMIT`]; a bigger value is not an error, but the server
+    /// answers with at most its advertised `page_size_limit` items.
     pub fn list(&self, token: &str, offset: u64, limit: u64) -> TracedResult<RemotesResponse> {
-        let url = format!(
-            "{}/remotes?offset={offset}&limit={limit}&version=v2&new_server=1",
-            self.api_base
-        );
+        let url = remotes_list_url(&self.api_base, offset, limit);
         let (calls, text) = self.send(token, "list remotes", "GET", &url, None, None)?;
         trace::finish(
             calls,
@@ -225,11 +249,12 @@ impl RemoteApi {
     ///
     /// This is a **list + find**, not a lookup by id: the endpoint set has no
     /// "get remote by id" call, so the whole account list is fetched first
-    /// (capped at 10 000 remotes, `list(token, 0, 10_000)`) and scanned in
-    /// memory. A miss therefore means "not among the first 10 000 remotes
-    /// listed", which is what the error message reports.
+    /// (one page of [`REMOTE_PAGE_LIMIT`] remotes, `list(token, 0,
+    /// REMOTE_PAGE_LIMIT)`) and scanned in memory. A miss therefore means
+    /// "not among the first 10 000 remotes listed", which is what the error
+    /// message reports.
     pub fn find(&self, token: &str, remote_id: u64) -> TracedResult<Remote> {
-        let all = self.list(token, 0, 10_000)?;
+        let all = self.list(token, 0, REMOTE_PAGE_LIMIT)?;
         let calls = all.calls;
         let remotes = all.data.remotes;
         let scanned = remotes.len();
@@ -344,5 +369,35 @@ mod tests {
         assert_eq!(v["name"], "New-Name");
         assert_eq!(v["description"], "New-Memo");
         assert_eq!(v["update_type"], 1);
+    }
+
+    /// `offset >= total` answers a body **without** the `remotes` key —
+    /// captured live as `GET /remotes?offset=1&limit=1` on a one-remote
+    /// account returning `{"total":1,"page_size_limit":10000}`. It has to
+    /// parse as an empty page: before `#[serde(default)]` this exact body
+    /// failed with `missing field `remotes``, which would have turned
+    /// `--offset` past the end into a bogus parse error.
+    #[test]
+    fn parse_remotes_empty_page_without_remotes_key() {
+        let json = r#"{"total":1,"page_size_limit":10000}"#;
+        let parsed: RemotesResponse = serde_json::from_str(json).unwrap();
+        assert!(parsed.remotes.is_empty());
+        assert_eq!(parsed.total, Some(1));
+        assert_eq!(parsed.page_size_limit, Some(10_000));
+    }
+
+    /// The query shape is shared by `list`, `find` and the CLI default, and
+    /// stays byte-identical to what the app sends.
+    #[test]
+    fn list_url_carries_offset_and_limit() {
+        assert_eq!(REMOTE_PAGE_LIMIT, 10_000);
+        assert_eq!(
+            remotes_list_url("https://api-std.sunlogin.oray.com", 0, REMOTE_PAGE_LIMIT),
+            "https://api-std.sunlogin.oray.com/remotes?offset=0&limit=10000&version=v2&new_server=1"
+        );
+        assert_eq!(
+            remotes_list_url("https://api-std.sunlogin.oray.com", 42, 7),
+            "https://api-std.sunlogin.oray.com/remotes?offset=42&limit=7&version=v2&new_server=1"
+        );
     }
 }

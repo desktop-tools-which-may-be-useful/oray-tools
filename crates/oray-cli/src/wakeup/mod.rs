@@ -24,17 +24,24 @@ pub mod plug;
 use crate::config::Config;
 use crate::prompt;
 use crate::support::{emit_json, with_token};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use oray_core::wakeup::plug::PlugApi;
-use oray_core::wakeup::{WakeupApi, WakeupDevice};
+use oray_core::wakeup::{DEVICE_LIST_LIMIT, WakeupApi, WakeupDevice, effective_device_limit};
 use reqwest::blocking::Client as HttpClient;
 use std::path::PathBuf;
 
 #[derive(Subcommand)]
 pub enum WakeupCmd {
-    /// List wakeup devices (smart plugs / power hardware)
-    List,
+    /// List wakeup devices (smart plugs / power hardware; paged)
+    List {
+        /// First device of the page to fetch
+        #[arg(long, default_value_t = 0, display_order = 0)]
+        offset: u64,
+        /// Devices per request (default 100, capped at 10000)
+        #[arg(long, default_value_t = DEVICE_LIST_LIMIT, display_order = 0)]
+        limit: usize,
+    },
     /// Show details for one device (by SN)
     Info {
         /// Device serial number
@@ -75,6 +82,33 @@ fn json_memo(sn: &str, memo: &str) -> serde_json::Value {
     serde_json::json!({ "ok": true, "sn": sn, "memo": memo })
 }
 
+/// Post-hoc page warnings for `wakeup list`, printed on **stderr** so the
+/// `--json` contract (exactly one value on stdout) stays intact.
+///
+/// This endpoint answers neither `total` nor a page-size limit, so the only
+/// honest signals are local ones: a `--limit` the client did not send as
+/// asked, and a page that came back exactly full — which may be the whole
+/// account or the first of several, and the response cannot tell them apart.
+fn page_warnings(offset: u64, limit: usize, shown: usize) -> Vec<String> {
+    let effective = effective_device_limit(limit);
+    let mut warnings = Vec::new();
+    if effective != limit {
+        warnings.push(format!(
+            "warning: --limit {limit} requested, {effective} sent — the endpoint publishes no \
+             page size, so this client bounds its own request"
+        ));
+    }
+    if shown == effective {
+        warnings.push(format!(
+            "warning: a full page ({shown} fetched at --limit {effective}) and the endpoint \
+             reports no total, so more may exist — fetch the next one with \
+             `oray-tools wakeup list --offset {}`",
+            offset + shown as u64
+        ));
+    }
+    warnings
+}
+
 /// `--interactive`: type the arguments this command line left out.
 ///
 /// A no-op unless the flag is set (defense in depth on top of clap's strict
@@ -85,7 +119,8 @@ pub fn fill(cmd: &mut WakeupCmd, interactive: bool) -> Result<()> {
         return Ok(());
     }
     match cmd {
-        WakeupCmd::List => Ok(()),
+        // `--offset`/`--limit` both default, so nothing is left to ask for.
+        WakeupCmd::List { .. } => Ok(()),
         WakeupCmd::Info { sn } => fill_sn(sn, "oray-tools wakeup info <sn>"),
         WakeupCmd::Rename { sn, new_name } => {
             prompt::require_terminal(
@@ -126,10 +161,21 @@ pub fn run(
     let wakeup = WakeupApi::new(http.clone(), &server.api_base);
     let plug = PlugApi::new(http.clone(), &server.slapi_base);
     match sub {
-        WakeupCmd::List => {
+        WakeupCmd::List { offset, limit } => {
+            // A zero limit is not a page size, so refuse it before spending a
+            // token round trip (`effective_device_limit` maps 0 to the
+            // default for direct API callers, but the flag should be explicit).
+            if limit == 0 {
+                bail!("--limit must be at least 1");
+            }
             let devices = with_token(http, cfg, path, refresh_on_expired, |tok| {
-                wakeup.list(tok, None)
+                wakeup.list(tok, offset, limit, None)
             })?;
+            // A full page or a capped `--limit` cannot be seen from the JSON
+            // alone; both go to stderr, never stdout.
+            for warning in page_warnings(offset, limit, devices.devices.len()) {
+                eprintln!("{warning}");
+            }
             emit_json(json, &devices)?;
             if !json {
                 for d in &devices.devices {
@@ -232,5 +278,38 @@ mod tests {
             body(json_memo("100000000001", "阳台")),
             serde_json::json!({ "ok": true, "sn": "100000000001", "memo": "阳台" })
         );
+    }
+
+    /// A full page is the endpoint's only hint that more devices may exist,
+    /// so it has to be reported — together with any capped `--limit`.
+    #[test]
+    fn page_warnings_flag_a_full_page_and_a_capped_limit() {
+        let full = page_warnings(0, DEVICE_LIST_LIMIT, DEVICE_LIST_LIMIT);
+        assert_eq!(full.len(), 1, "{full:?}");
+        assert!(
+            full[0].contains("a full page (100 fetched at --limit 100)"),
+            "{}",
+            full[0]
+        );
+        assert!(full[0].contains("--offset 100"), "{}", full[0]);
+
+        let capped = page_warnings(0, 20_000, 10_000);
+        assert_eq!(capped.len(), 2, "{capped:?}");
+        assert!(
+            capped[0].contains("--limit 20000 requested, 10000 sent"),
+            "{}",
+            capped[0]
+        );
+        assert!(capped[1].contains("--offset 10000"), "{}", capped[1]);
+    }
+
+    /// A short page is provably the last one: nothing to warn about, and the
+    /// next-page offset advances by what was actually fetched.
+    #[test]
+    fn page_warnings_stay_quiet_on_a_short_page() {
+        assert!(page_warnings(0, DEVICE_LIST_LIMIT, 3).is_empty());
+        let next = page_warnings(150, 50, 50);
+        assert_eq!(next.len(), 1, "{next:?}");
+        assert!(next[0].contains("--offset 200"), "{}", next[0]);
     }
 }

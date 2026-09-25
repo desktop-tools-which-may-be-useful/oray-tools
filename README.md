@@ -254,10 +254,14 @@ every device command work unchanged. The shield base URL is configurable as
 Wakeup devices — smart plugs / power hardware (all data from the cloud):
 
 ```
-oray-tools wakeup list                        # list devices
+oray-tools wakeup list [--offset N] [--limit N]  # list devices (paged)
 oray-tools wakeup info <sn>                   # device details
 oray-tools wakeup rename <sn> <new-name>      # rename (keeps the memo)
 oray-tools wakeup memo <sn> <text>            # set the memo/备注 (keeps the name)
+# --offset selects the first device and --limit the page size (default 100,
+# capped at 10000). The endpoint reports no total, so a page that comes back
+# full prints a warning on stderr — "more may exist", with the --offset to
+# continue — instead of being taken for the whole account.
 
 oray-tools wakeup plug status <sn> [--index N]            # query outlet state
 oray-tools wakeup plug on <sn> [--index N]                # switch on
@@ -287,11 +291,15 @@ oray-tools wakeup plug power-on-restore <sn> <0|2>        # state after power lo
 Remote devices — PCs / phones (all data from the cloud):
 
 ```
-oray-tools remote list                       # list remotes
+oray-tools remote list [--offset N] [--limit N]  # list remotes (paged)
 oray-tools remote info <id>                  # extended detail
 oray-tools remote status <id>                # online state / last seen
 oray-tools remote rename <id> <new-name>     # rename (keeps the memo)
 oray-tools remote memo <id> <text>           # set the memo (keeps the name)
+# --offset selects the first remote and --limit the page size (default 10000 =
+# the endpoint's own `page_size_limit`; a bigger value is clamped server-side).
+# The response's `total` decides whether more pages follow: stderr then warns
+# `showing N of M remotes` with the `--offset` to continue.
 # `remote status|rename|memo` fetch the single remote directly
 # (`GET /console/remotes/<id>`); they no longer download the whole device
 # list to resolve one id. A miss reports the endpoint's own HTTP error,
