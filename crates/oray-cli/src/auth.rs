@@ -1,15 +1,22 @@
 //! `auth` command group: authentication management (locally stored).
 
 use crate::config::Config;
+use crate::prompt;
 use crate::support::{emit_json, hostname, print_tokens, resolve_clientid, traced};
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use oray_core::auth::{AuthApi, LoginOutcome};
 use reqwest::blocking::Client as HttpClient;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 #[derive(Subcommand)]
 pub enum AuthCmd {
+    /// Interactive sign-in: choose a login method and type the parameters
+    ///
+    /// This is the only command that prompts. `login`/`login-sms` keep their
+    /// required arguments and fail when one is missing.
+    Interactive,
     /// Log in with an Oray account (a fresh device may prompt for an SMS code)
     Login {
         /// Oray account (mobile number or email)
@@ -50,6 +57,8 @@ pub fn run(
     json: bool,
 ) -> Result<()> {
     match sub {
+        // Interactive prompting is opt-in: only this subcommand asks.
+        AuthCmd::Interactive => interactive(http, cfg, path, clientid, json),
         AuthCmd::Login { account, password } => {
             do_login(http, cfg, path, clientid, &account, &password, json)
         }
@@ -77,6 +86,96 @@ pub fn run(
     }
 }
 
+/// Interactive session behind `oray-tools auth interactive`: pick a login
+/// method, then enter the parameters it needs. The protocol layer is
+/// untouched by this — it only receives the finished values.
+fn interactive(
+    http: &HttpClient,
+    cfg: &mut Config,
+    path: &PathBuf,
+    clientid: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "the interactive session needs a terminal; run a concrete command instead, \
+             e.g. `oray-tools auth login <account> <password>` or \
+             `oray-tools auth login-sms <mobile>`"
+        );
+    }
+    // The stdin lock is held only for the menu: `Stdin::lock` is not
+    // reentrant, and the helpers below read stdin themselves.
+    eprintln!("oray-tools: interactive sign-in");
+    let method = {
+        let stdin = std::io::stdin();
+        let mut input = stdin.lock();
+        prompt::choose_from(
+            &mut input,
+            &mut std::io::stderr(),
+            "Login method",
+            &[
+                "password (account + password)",
+                "SMS code (mobile, no password)",
+                "quit",
+            ],
+        )?
+    };
+    match method {
+        0 => {
+            let (account, password) = ask_password_login(cfg)?;
+            do_login(http, cfg, path, clientid, &account, &password, json)
+        }
+        1 => {
+            let mobile = ask_mobile(cfg)?;
+            do_login_sms(
+                http,
+                cfg,
+                path,
+                clientid,
+                &mobile,
+                SmsLoginOpts::default(),
+                json,
+            )
+        }
+        _ => {
+            eprintln!("cancelled");
+            Ok(())
+        }
+    }
+}
+
+/// Collect the account/password pair. The password comes back from a
+/// no-echo prompt.
+fn ask_password_login(cfg: &Config) -> Result<(String, String)> {
+    let saved = cfg.account.as_ref().map(|a| a.account.clone());
+    let account = prompt::ask(
+        &mut std::io::stdin().lock(),
+        &mut std::io::stderr(),
+        "Account (mobile or email)",
+        saved.as_deref(),
+    )?;
+    let password = prompt::ask_secret("Password")?;
+    Ok((account, password))
+}
+
+/// Collect the mobile number for the SMS flow, offering the saved account
+/// when it is a plausible mobile number.
+fn ask_mobile(cfg: &Config) -> Result<String> {
+    let saved = cfg
+        .account
+        .as_ref()
+        .map(|a| a.account.clone())
+        .filter(|a| check_mobile(a).is_ok());
+    let mobile = prompt::ask(
+        &mut std::io::stdin().lock(),
+        &mut std::io::stderr(),
+        "Mobile number",
+        saved.as_deref(),
+    )?;
+    check_mobile(&mobile)?;
+    Ok(mobile)
+}
+
 /// `123****8901` — recognizable, but not usable to harvest the number.
 fn mask_mobile(mobile: &str) -> String {
     let chars: Vec<char> = mobile.chars().collect();
@@ -101,18 +200,12 @@ fn check_mobile(mobile: &str) -> Result<()> {
 
 /// Read a verification code from stdin (shared by both login flows).
 fn prompt_code() -> Result<String> {
-    use std::io::Write;
-    eprint!("Enter the SMS code: ");
-    std::io::stdout().flush().ok();
-    let mut code = String::new();
-    std::io::stdin()
-        .read_line(&mut code)
-        .context("failed to read code input")?;
-    let code = code.trim().to_string();
-    if code.is_empty() {
-        bail!("no code entered");
-    }
-    Ok(code)
+    prompt::ask(
+        &mut std::io::stdin().lock(),
+        &mut std::io::stderr(),
+        "SMS code",
+        None,
+    )
 }
 
 fn do_login(
@@ -176,6 +269,7 @@ fn do_login(
 }
 
 /// Optional inputs of the SMS login flow.
+#[derive(Default)]
 struct SmsLoginOpts<'a> {
     /// A code the user already holds (e.g. requested in the official app):
     /// skips the captcha step and the SMS request.

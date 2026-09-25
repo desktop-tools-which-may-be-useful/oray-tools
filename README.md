@@ -6,8 +6,11 @@ every device list/info/status is fetched live from the cloud on each command.
 
 ## Features
 
-- `auth login` — authenticate with account/password and persist tokens;
-  handles the SMS-verification flow used when registering a new trusted device
+- `auth interactive` — **显式**交互式登录: choose the login method (password /
+  SMS code) and type the parameters; prompting exists only behind this
+  subcommand. `auth login <account> <password>` stays argument-driven and
+  also handles the SMS-verification flow used when registering a new trusted
+  device
 - `auth login-sms <mobile>` — passwordless login with an SMS code
   (**手机验证码**): opens a browser for the slider captcha, requests the code
   and exchanges it for tokens (see [SMS login](#sms-login))
@@ -141,12 +144,47 @@ latest `.deb`/`.exe` while history lives in GitHub Releases.
 Authentication (stored locally):
 
 ```
+oray-tools auth interactive                   # interactive: choose a method, type the parameters
 oray-tools auth login <account> <password>   # first run on a device may prompt for an SMS code
 oray-tools auth login-sms <mobile>           # passwordless: captcha in the browser + SMS code
 oray-tools auth refresh                      # renew tokens
 oray-tools auth status                       # show token info and expiry (--json)
 oray-tools auth logout                       # clear saved tokens and account
 ```
+
+### Interactive sign-in
+
+Prompting is opt-in: it exists only behind `oray-tools auth interactive`.
+Pick a login method, then answer the prompts — the saved account is offered
+as the default and the password is read without echoing it:
+
+```
+$ oray-tools auth interactive
+oray-tools: interactive sign-in
+Login method:
+  1) password (account + password)
+  2) SMS code (mobile, no password)
+  3) quit
+Choose 1-3: 1
+Account (mobile or email) [alice@example.com]:
+Password:
+```
+
+- `auth login <account> <password>` and `auth login-sms <mobile>` never ask:
+  their arguments are required, and a missing one is the usual
+  `error: the following required arguments were not provided: <PASSWORD>`.
+  A bare `oray-tools auth` fails like the other subcommand groups
+  (`wakeup`, `remote`): usage help and exit code 2.
+- Prompts go to **stderr**, so `--json` output on stdout stays
+  machine-readable.
+- Without a terminal (a pipe, CI) `auth interactive` fails immediately
+  instead of hanging.
+
+The split is deliberate: every human interaction — prompts, the SMS-code
+question, the slider captcha — lives in `oray-cli` (`prompt.rs`,
+`captcha.rs`), while `oray-core` stays a pure protocol layer of endpoints
+and data exchange (enforced by `crates/oray-core/tests/purity.rs`, which
+fails if interaction primitives show up in the core).
 
 ### SMS login
 
@@ -288,8 +326,11 @@ timezone for a single run and accepts the same formats as the config value
 
 The project is a Cargo workspace with two crates:
 
-- `crates/oray-core` — the protocol layer only, no filesystem/CLI surface and
-  no output of its own. Stateless HTTP clients over the Oray cloud APIs:
+- `crates/oray-core` — the protocol layer only: endpoints, request/response
+  shapes and data exchange. No filesystem/CLI surface, no output of its own
+  and no human interaction — `tests/purity.rs` scans the crate's sources and
+  fails if stdin/prompt/process/filesystem primitives appear there.
+  Stateless HTTP clients over the Oray cloud APIs:
   - `auth` — password login, SMS-code login (`send_login_code`,
     `login_with_code`), the trusted-device verification flow and refresh
   - `wakeup` — `/wakeup/devices` listing (`WakeupApi`)
@@ -301,11 +342,13 @@ The project is a Cargo workspace with two crates:
   Network errors (`oray_core::Error`) and all state are owned by the caller.
 - `crates/oray-cli` — the `oray-tools` binary: clap argument parsing, command
   dispatch, persisted config (`config.rs`), token lifecycle and client-id
-  management (`token.rs`), and the loopback browser handshake for the login
-  captcha (`captcha.rs` + `captcha_page.html`). It owns every presentation
-  concern — `--json`, human text and the `--verbose`/`--trace-raw` request
-  rendering — by consuming the traces the core returns. It injects a shared
-  HTTP client into the core APIs and owns every side effect.
+  management (`token.rs`), the interactive prompts (`prompt.rs`) and the
+  loopback browser handshake for the login captcha (`captcha.rs` +
+  `captcha_page.html`). It owns every presentation concern — `--json`, human
+  text and the `--verbose`/`--trace-raw` request rendering — by consuming the
+  traces the core returns. It injects a shared HTTP client into the core APIs
+  and owns every side effect: everything a *person* does (typing a parameter,
+  solving the slider) happens here, never in the core.
 
 Dependencies flow one way only: `oray-cli → oray-core`. Build locally with
 `cargo build` (the workspace `default-members` builds only the CLI).

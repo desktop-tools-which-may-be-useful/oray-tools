@@ -1,6 +1,7 @@
 mod auth;
 mod captcha;
 mod config;
+mod prompt;
 mod remote;
 mod support;
 mod token;
