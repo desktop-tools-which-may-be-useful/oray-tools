@@ -17,6 +17,22 @@ pub enum AuthCmd {
         /// Account password (stored locally as md5)
         password: String,
     },
+    /// Log in with an SMS code instead of a password (`auth login-sms`)
+    LoginSms {
+        /// Mobile number bound to the account; it receives the login code
+        mobile: String,
+        /// Use a code you already received (e.g. from the official app):
+        /// skips the captcha step and the SMS request
+        #[arg(long)]
+        code: Option<String>,
+        /// Reuse a captcha token obtained elsewhere instead of the browser
+        /// step (advanced / scripted use)
+        #[arg(long)]
+        captcha: Option<String>,
+        /// Print the captcha URL instead of opening a browser
+        #[arg(long)]
+        no_browser: bool,
+    },
     /// Renew tokens with the saved refresh_token
     Refresh,
     /// Show current token info and expiry
@@ -37,10 +53,66 @@ pub fn run(
         AuthCmd::Login { account, password } => {
             do_login(http, cfg, path, clientid, &account, &password, json)
         }
+        AuthCmd::LoginSms {
+            mobile,
+            code,
+            captcha,
+            no_browser,
+        } => do_login_sms(
+            http,
+            cfg,
+            path,
+            clientid,
+            &mobile,
+            SmsLoginOpts {
+                code: code.as_deref(),
+                captcha: captcha.as_deref(),
+                no_browser,
+            },
+            json,
+        ),
         AuthCmd::Refresh => do_refresh(http, cfg, path, clientid, json),
         AuthCmd::Status => do_status(cfg, json),
         AuthCmd::Logout => do_logout(cfg, path, json),
     }
+}
+
+/// `123****8901` — recognizable, but not usable to harvest the number.
+fn mask_mobile(mobile: &str) -> String {
+    let chars: Vec<char> = mobile.chars().collect();
+    if chars.len() >= 7 {
+        let head: String = chars[..3].iter().collect();
+        let tail: String = chars[chars.len() - 4..].iter().collect();
+        format!("{head}****{tail}")
+    } else {
+        "*".repeat(chars.len().max(1))
+    }
+}
+
+/// A login target for the SMS flow: digits (an optional leading `+` for
+/// international numbers), 6-15 characters.
+fn check_mobile(mobile: &str) -> Result<()> {
+    let digits = mobile.strip_prefix('+').unwrap_or(mobile);
+    if digits.is_empty() || digits.len() > 15 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        bail!("expected a mobile number like 12345678901, got '{mobile}'");
+    }
+    Ok(())
+}
+
+/// Read a verification code from stdin (shared by both login flows).
+fn prompt_code() -> Result<String> {
+    use std::io::Write;
+    eprint!("Enter the SMS code: ");
+    std::io::stdout().flush().ok();
+    let mut code = String::new();
+    std::io::stdin()
+        .read_line(&mut code)
+        .context("failed to read code input")?;
+    let code = code.trim().to_string();
+    if code.is_empty() {
+        bail!("no code entered");
+    }
+    Ok(code)
 }
 
 fn do_login(
@@ -70,17 +142,7 @@ fn do_login(
                 alert.error, alert.code
             );
             traced("send verification code", api.sendcode(&cid, account))?;
-            eprint!("Enter the SMS code: ");
-            use std::io::Write;
-            std::io::stdout().flush().ok();
-            let mut code = String::new();
-            std::io::stdin()
-                .read_line(&mut code)
-                .context("failed to read code input")?;
-            let code = code.trim().to_string();
-            if code.is_empty() {
-                bail!("no code entered");
-            }
+            let code = prompt_code()?;
             traced(
                 "verify code",
                 api.checkcode(&cid, account, &code, &terminal_name),
@@ -109,6 +171,99 @@ fn do_login(
         emit_json(true, &serde_json::json!({ "ok": true, "account": account }))?;
     } else {
         println!("logged in as {account}");
+    }
+    Ok(())
+}
+
+/// Optional inputs of the SMS login flow.
+struct SmsLoginOpts<'a> {
+    /// A code the user already holds (e.g. requested in the official app):
+    /// skips the captcha step and the SMS request.
+    code: Option<&'a str>,
+    /// Captcha token supplied instead of running the browser step.
+    captcha: Option<&'a str>,
+    /// Print the captcha URL instead of opening a browser.
+    no_browser: bool,
+}
+
+/// Passwordless login: solve the captcha in a browser, receive the SMS code
+/// and exchange it for tokens.
+fn do_login_sms(
+    http: &HttpClient,
+    cfg: &mut Config,
+    path: &PathBuf,
+    clientid: Option<&str>,
+    mobile: &str,
+    opts: SmsLoginOpts<'_>,
+    json: bool,
+) -> Result<()> {
+    check_mobile(mobile)?;
+    let cid = resolve_clientid(cfg, clientid);
+    let server = cfg.server();
+    let api = AuthApi::new(http.clone(), &server.api_base).shield_base(&server.shield_base);
+
+    // The shield endpoint only accepts a request carrying an Aliyun captcha
+    // result, so one has to be produced in a browser first — unless a code
+    // was obtained elsewhere and nothing has to be sent.
+    let code = match opts.code {
+        Some(code) => {
+            eprintln!("using the supplied code; skipping the captcha and the SMS request");
+            code.to_string()
+        }
+        None => {
+            let captcha_token = match opts.captcha {
+                Some(token) => token.to_string(),
+                None => crate::captcha::obtain_token(
+                    &mask_mobile(mobile),
+                    !opts.no_browser,
+                    crate::captcha::DEFAULT_TIMEOUT,
+                )?,
+            };
+            let sent = traced("send sms code", api.send_login_code(mobile, &captcha_token))?;
+            if let Some(n) = sent.request_num {
+                eprintln!(
+                    "verification code requested for {} (daily request #{n})",
+                    mask_mobile(mobile)
+                );
+            } else {
+                eprintln!("verification code requested for {}", mask_mobile(mobile));
+            }
+            prompt_code()?
+        }
+    };
+    let resp = match traced("sms login", api.login_with_code(&cid, mobile, &code))? {
+        LoginOutcome::Tokens(resp) => resp,
+        LoginOutcome::NewDevice(alert) => bail!(
+            "server asked for extra device verification ({}); a password login is required for \
+             this device — run `oray-tools auth login <account> <password>`",
+            alert.error
+        ),
+    };
+
+    // No password backs an SMS login: keep a stored md5 only when it belongs
+    // to this same account, otherwise clear it.
+    let password_md5 = cfg
+        .account
+        .as_ref()
+        .filter(|a| a.account == mobile)
+        .map(|a| a.password_md5.clone())
+        .unwrap_or_default();
+    cfg.account = Some(crate::config::Account {
+        account: mobile.to_string(),
+        password_md5,
+    });
+    cfg.client = Some(crate::config::Client { clientid: cid });
+    let expiry = crate::token::refresh_expiry(&resp);
+    cfg.token = Some(crate::config::Token {
+        access_token: resp.access_token,
+        refresh_token: resp.refresh_token,
+        refresh_expires: expiry,
+    });
+    cfg.save(path)?;
+    if json {
+        emit_json(true, &serde_json::json!({ "ok": true, "account": mobile }))?;
+    } else {
+        println!("logged in as {mobile}");
     }
     Ok(())
 }

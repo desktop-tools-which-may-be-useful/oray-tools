@@ -8,6 +8,9 @@ every device list/info/status is fetched live from the cloud on each command.
 
 - `auth login` — authenticate with account/password and persist tokens;
   handles the SMS-verification flow used when registering a new trusted device
+- `auth login-sms <mobile>` — passwordless login with an SMS code
+  (**手机验证码**): opens a browser for the slider captcha, requests the code
+  and exchanges it for tokens (see [SMS login](#sms-login))
 - `auth refresh / status / logout` — renew tokens, show expiry, clear local state
 - `wakeup` — **开机设备** (smart plugs / power hardware), from `/wakeup/devices`:
   - `list`, `info <sn>`, `rename`, `memo`
@@ -139,10 +142,44 @@ Authentication (stored locally):
 
 ```
 oray-tools auth login <account> <password>   # first run on a device may prompt for an SMS code
+oray-tools auth login-sms <mobile>           # passwordless: captcha in the browser + SMS code
 oray-tools auth refresh                      # renew tokens
 oray-tools auth status                       # show token info and expiry (--json)
 oray-tools auth logout                       # clear saved tokens and account
 ```
+
+### SMS login
+
+`auth login-sms <mobile>` logs in without a password, using the same flow as
+the Sunlogin clients (a proxy capture of the Android client was used to derive
+it):
+
+1. A loopback page (`http://127.0.0.1:<port>/`) is served and opened in the
+   browser with Aliyun's slider captcha (scene `1sdsal45`). Solve it; the page
+   posts the captcha result back to the CLI. Use `--no-browser` to get the URL
+   printed instead of opened, or `--captcha <token>` to supply a result
+   obtained elsewhere.
+2. The CLI asks the shield service for the code:
+   `POST https://shield-api-v3.oray.com/seccode/mobile` with
+   `plan_alias=sl-code-client-login` and
+   `checksum = md5(plan_alias + mobile + "/seccode/mobile" + timestamp)`.
+   The shield service rejects any request without a captcha result, which is
+   why step 1 cannot be skipped.
+3. The code you receive on the phone is exchanged for tokens:
+   `POST https://api-std.sunlogin.oray.com/authorization`
+   with `type=securecode, medium=sms, code-type=sl-code-client-login`.
+
+```
+oray-tools auth login-sms 12345678901                # prompts for the code
+oray-tools auth login-sms 12345678901 --no-browser   # print the captcha URL
+                                                     # instead of opening it
+oray-tools auth login-sms 12345678901 --code 123456  # code you already have:
+                                                     # skips captcha + SMS request
+```
+
+Tokens are stored like a password login, so `auth refresh`, `auth status` and
+every device command work unchanged. The shield base URL is configurable as
+`server.shield_base`.
 
 Wakeup devices — smart plugs / power hardware (all data from the cloud):
 
@@ -232,6 +269,7 @@ refresh_expires = ...
 [server]
 # api_base    = "https://api-std.sunlogin.oray.com"   # defaults
 # slapi_base  = "https://slapi.oray.net"
+# shield_base = "https://shield-api-v3.oray.com"      # sends SMS login codes
 
 # Timezone of the plug for timer scheduling and for absolute `logs
 # --since/--until` windows / displayed times, same format as --tz
@@ -252,7 +290,8 @@ The project is a Cargo workspace with two crates:
 
 - `crates/oray-core` — the protocol layer only, no filesystem/CLI surface and
   no output of its own. Stateless HTTP clients over the Oray cloud APIs:
-  - `auth` — login/refresh/SMS-verification token flow
+  - `auth` — password login, SMS-code login (`send_login_code`,
+    `login_with_code`), the trusted-device verification flow and refresh
   - `wakeup` — `/wakeup/devices` listing (`WakeupApi`)
   - `plug` — smart-plug controls on `slapi.oray.net` (`PlugApi`)
   - `remote` — remote devices on `api-std` (`RemoteApi`)
@@ -262,10 +301,11 @@ The project is a Cargo workspace with two crates:
   Network errors (`oray_core::Error`) and all state are owned by the caller.
 - `crates/oray-cli` — the `oray-tools` binary: clap argument parsing, command
   dispatch, persisted config (`config.rs`), token lifecycle and client-id
-  management (`token.rs`). It owns every presentation concern — `--json`,
-  human text and the `--verbose`/`--trace-raw` request rendering — by consuming
-  the traces the core returns. It injects a shared HTTP client into the core
-  APIs and owns every side effect.
+  management (`token.rs`), and the loopback browser handshake for the login
+  captcha (`captcha.rs` + `captcha_page.html`). It owns every presentation
+  concern — `--json`, human text and the `--verbose`/`--trace-raw` request
+  rendering — by consuming the traces the core returns. It injects a shared
+  HTTP client into the core APIs and owns every side effect.
 
 Dependencies flow one way only: `oray-cli → oray-core`. Build locally with
 `cargo build` (the workspace `default-members` builds only the CLI).

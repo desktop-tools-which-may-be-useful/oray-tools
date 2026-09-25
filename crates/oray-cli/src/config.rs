@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 pub const DEFAULT_API_BASE: &str = "https://api-std.sunlogin.oray.com";
 pub const DEFAULT_SLAPI_BASE: &str = "https://slapi.oray.net";
+/// Shield service that sends SMS login codes (see `oray_core::auth`).
+pub const DEFAULT_SHIELD_BASE: &str = oray_core::auth::SHIELD_BASE;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Account {
@@ -29,6 +31,10 @@ pub struct Client {
 pub struct Server {
     pub api_base: String,
     pub slapi_base: String,
+    /// Shield service that sends SMS login codes. Omitted by older configs,
+    /// hence the default.
+    #[serde(default)]
+    pub shield_base: String,
 }
 
 /// Local configuration. Only authentication material is stored: account,
@@ -89,6 +95,7 @@ impl Default for Server {
         Server {
             api_base: DEFAULT_API_BASE.to_string(),
             slapi_base: DEFAULT_SLAPI_BASE.to_string(),
+            shield_base: DEFAULT_SHIELD_BASE.to_string(),
         }
     }
 }
@@ -105,6 +112,11 @@ impl Server {
                 DEFAULT_SLAPI_BASE.to_string()
             } else {
                 self.slapi_base.trim_end_matches('/').to_string()
+            },
+            shield_base: if self.shield_base.is_empty() {
+                DEFAULT_SHIELD_BASE.to_string()
+            } else {
+                self.shield_base.trim_end_matches('/').to_string()
             },
         }
     }
@@ -142,6 +154,24 @@ sn = "100000000001"
         let s = Server::default().normalized();
         assert_eq!(s.api_base, DEFAULT_API_BASE);
         assert_eq!(s.slapi_base, DEFAULT_SLAPI_BASE);
+        assert_eq!(s.shield_base, DEFAULT_SHIELD_BASE);
+    }
+
+    /// A config written before `shield_base` existed still parses, and the
+    /// missing value falls back to the default shield service.
+    #[test]
+    fn legacy_server_without_shield_base() {
+        let parsed: Server = toml::from_str(
+            r#"
+api_base = "https://api.example.com"
+slapi_base = "https://slapi.example.net"
+"#,
+        )
+        .unwrap();
+        assert!(parsed.shield_base.is_empty(), "field is absent in the file");
+        let s = parsed.normalized();
+        assert_eq!(s.api_base, "https://api.example.com");
+        assert_eq!(s.shield_base, DEFAULT_SHIELD_BASE);
     }
 
     #[test]
@@ -149,9 +179,11 @@ sn = "100000000001"
         let s = Server {
             api_base: "https://api.example.com/".into(),
             slapi_base: "".into(),
+            shield_base: "https://shield.example.com/".into(),
         }
         .normalized();
         assert_eq!(s.api_base, "https://api.example.com");
         assert_eq!(s.slapi_base, DEFAULT_SLAPI_BASE);
+        assert_eq!(s.shield_base, "https://shield.example.com");
     }
 }

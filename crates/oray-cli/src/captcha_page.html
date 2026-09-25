@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>oray-tools 安全验证</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0; padding: 48px 20px; min-height: 100vh; box-sizing: border-box;
+    display: flex; flex-direction: column; align-items: center; gap: 16px;
+    font-family: "PingFang SC", -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: #f5f6f7; color: #17171a;
+  }
+  @media (prefers-color-scheme: dark) { body { background: #17171a; color: #f5f6f7; } }
+  .card {
+    width: 100%; max-width: 420px; background: rgba(255,255,255,.9);
+    border: 1px solid #e5e6eb; border-radius: 12px; padding: 24px;
+    box-shadow: 0 8px 24px rgba(0,0,0,.06); text-align: center;
+  }
+  @media (prefers-color-scheme: dark) {
+    .card { background: #1a1a1a; border-color: #2e2e30; }
+  }
+  h1 { font-size: 18px; margin: 0 0 8px; }
+  p  { font-size: 14px; line-height: 1.6; margin: 6px 0; color: #4e5058; }
+  @media (prefers-color-scheme: dark) { p { color: #c9cdd4; } }
+  .target { font-weight: 600; color: #17171a; }
+  @media (prefers-color-scheme: dark) { .target { color: #fff; } }
+  #status { min-height: 22px; color: #3773f5; }
+  #status.err { color: #d54941; }
+  #aliyunCaptchaElement { min-height: 44px; display: flex; justify-content: center; }
+  .hint { font-size: 12px; color: #909399; }
+  #aliyunCaptchaBtn { visibility: hidden; }
+</style>
+<script src="https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js"></script>
+<script>
+  window.AliyunCaptchaConfig = { region: 'cn', prefix: '16ck57' };
+</script>
+</head>
+<body>
+  <div class="card">
+    <h1>oray-tools 安全验证</h1>
+    <p>即将向 <span class="target" id="target">{{MOBILE}}</span> 发送登录验证码</p>
+    <p>请先完成滑块验证 / please solve the slider below</p>
+    <div id="aliyunCaptchaElement"></div>
+    <button id="aliyunCaptchaBtn" type="button">开始验证</button>
+    <p id="status">正在加载验证组件…</p>
+    <p class="hint">完成后可关闭本页面，回到终端继续。</p>
+  </div>
+<script>
+(function () {
+  var statusEl = document.getElementById('status');
+  var done = false;
+  function setStatus(text, isError) {
+    statusEl.textContent = text;
+    statusEl.className = isError ? 'err' : '';
+  }
+  function trigger() {
+    var btn = document.getElementById('aliyunCaptchaBtn');
+    if (btn) btn.click();
+  }
+  function deliver(param, raw) {
+    if (done) return;
+    done = true;
+    setStatus('验证完成，正在返回终端…');
+    fetch('/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ captchaVerifyParam: param, raw: raw })
+    }).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      setStatus('验证完成，请回到终端继续。');
+    }).catch(function (e) {
+      done = false;
+      setStatus('回传失败：' + e.message + '（请重试）', true);
+      setTimeout(trigger, 500);
+    });
+  }
+  function success(res) {
+    if (res && res.verifyResult === false) {
+      setStatus('验证未通过，请重试', true);
+      setTimeout(trigger, 300);
+      return;
+    }
+    var param = typeof res === 'string' ? res : (res && res.captchaVerifyParam) || '';
+    if (!param) {
+      // No dedicated field: fall back to the whole payload (the shield
+      // endpoint accepts the base64 blob either way).
+      param = typeof res === 'string' ? res : JSON.stringify(res);
+    }
+    deliver(param, typeof res === 'string' ? res : JSON.stringify(res));
+  }
+  function fail(res) {
+    // F001/F004/F015 mean "challenge required": the slider is (or is about
+    // to be) on screen, which is expected — not an error.
+    var code = res && res.verifyCode;
+    if (code === 'F001' || code === 'F004' || code === 'F015') {
+      setStatus('请按住滑块，拖动到最右边');
+      return;
+    }
+    setStatus('验证未完成：' + JSON.stringify(res), true);
+    setTimeout(trigger, 500);
+  }
+  function boot() {
+    if (typeof window.initAliyunCaptcha !== 'function') {
+      setStatus('验证组件加载失败，请检查网络后刷新本页', true);
+      return;
+    }
+    try {
+      window.initAliyunCaptcha({
+        SceneId: '1sdsal45',
+        mode: 'popup',
+        element: '#aliyunCaptchaElement',
+        button: '#aliyunCaptchaBtn',
+        success: success,
+        fail: fail,
+        onClose: function () {
+          if (!done) setStatus('验证已关闭，请点击重新验证');
+        },
+        slideStyle: { width: 320, height: 40 },
+        language: 'cn'
+      });
+      setStatus('请完成安全验证');
+      setTimeout(trigger, 600);
+    } catch (e) {
+      setStatus('验证初始化失败：' + e.message, true);
+    }
+  }
+  window.addEventListener('load', boot);
+  document.getElementById('aliyunCaptchaBtn').addEventListener('click', function () {
+    if (statusEl.textContent === '验证已关闭，请点击重新验证') setStatus('请完成安全验证');
+  });
+})();
+</script>
+</body>
+</html>
