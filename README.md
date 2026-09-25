@@ -16,23 +16,33 @@ every device list/info/status is fetched live from the cloud on each command.
 - `auth login-sms <mobile>` — passwordless login with an SMS code
   (**手机验证码**): opens a browser for the slider captcha, requests the code
   and exchanges it for tokens (see [SMS login](#sms-login))
-- `auth refresh / status / logout` — renew tokens, show expiry, clear local state
+- `auth refresh / status / logout` — renew tokens, show expiry, clear local
+  state; `auth status` masks the tokens (`abcdef***`) and
+  `auth status --show` prints them in full
 - `wakeup` — **开机设备** (smart plugs / power hardware), from `/wakeup/devices`:
   - `list`, `info <sn>`, `rename`, `memo`
   - `plug status / on / off [--index N]` — query and switch an outlet
-  - `plug logs` — status-change history (paged, or windowed with `--since`/`--until`)
+  - `plug logs` — status-change history (paged, or windowed with
+    `--since`/`--until`); `--index N` optionally narrows the events to one
+    port (filtered client side) — omit it to keep every port
   - `plug timer list/add/remove` and `plug countdown status/start/stop`
   - `plug led on|off`, `plug power-on-restore <0|2>`
 - `remote` — **远程设备** (PCs / phones), from `/remotes`:
   - `list`, `info <id>`, `status <id>`, `rename`, `memo`
-- Machine-readable output: every command accepts `--json`
+- Machine-readable output: every command accepts `--json` — exactly one JSON
+  value on stdout when it succeeds, `error: ...` on stderr (exit code 1) when
+  it fails (see [Machine-readable output](#machine-readable-output---json))
 - Debug output: every command accepts `--verbose` (full request/response
   detail on stderr: method, URL, headers, request/response body). Sensitive
   values are masked by default; add `--trace-raw` to `--verbose` to see them
   verbatim
 - `--refresh-on-expired` on `wakeup`/`remote` refreshes the token and retries
-  once when the server reports `TOKEN_EXPIRED`
-- Machine-local trusted client ID (persisted, no hardcoded value)
+  once when the server reports `TOKEN_EXPIRED` **or** answers with a bare
+  HTTP 401. Detection is exact, so an unrelated business error that happens
+  to contain `1010` (`sn=1010… not found`) no longer triggers a pointless
+  refresh
+- Machine-local trusted client ID (persisted, no hardcoded value),
+  overridable for the run with `--clientid` on **any** command
 
 ## Installation
 
@@ -150,7 +160,8 @@ oray-tools auth login --interactive          # prompt for the arguments left out
 oray-tools auth login <account> <password>   # first run on a device may prompt for an SMS code
 oray-tools auth login-sms <mobile>           # passwordless: captcha in the browser + SMS code
 oray-tools auth refresh                      # renew tokens
-oray-tools auth status                       # show token info and expiry (--json)
+oray-tools auth status                       # token info and expiry, tokens masked (abcdef***)
+oray-tools auth status --show                # the same, printing the tokens in full
 oray-tools auth logout                       # clear saved tokens and account
 ```
 
@@ -206,7 +217,11 @@ it):
    browser with Aliyun's slider captcha (scene `1sdsal45`). Solve it; the page
    posts the captcha result back to the CLI. Use `--no-browser` to get the URL
    printed instead of opened, or `--captcha <token>` to supply a result
-   obtained elsewhere.
+   obtained elsewhere. That callback (`POST /token`) is only accepted from the
+   page's own origin (`http://127.0.0.1:<port>`) or from a request with no
+   `Origin` header at all — a cross-origin POST is refused with `403` before
+   it reaches the handler. The normal browser flow is same-origin, so it is
+   unaffected.
 2. The CLI asks the shield service for the code:
    `POST https://shield-api-v3.oray.com/seccode/mobile` with
    `plan_alias=sl-code-client-login` and
@@ -240,13 +255,16 @@ oray-tools wakeup memo <sn> <text>            # set the memo/备注 (keeps the n
 oray-tools wakeup plug status <sn> [--index N]            # query outlet state
 oray-tools wakeup plug on <sn> [--index N]                # switch on
 oray-tools wakeup plug off <sn> [--index N]               # switch off
-oray-tools wakeup plug logs <sn> [--since 2h] [--until 6h] [--page N] # status history
+oray-tools wakeup plug logs <sn> [--index N] [--since 2h] [--until 6h] [--page N] # status history
+# --index N is optional and has no default: with it the events of one port
+# are kept (filtered on the client side), without it every port is returned.
 # --since/--until bound the window (ago like 2h/1d, or an absolute time like
 # 2026-09-03 or 2026-09-03 09:00[:00]); a bare date runs to the day's end for
 # --until. Absolute times are read in the plug's timezone (--tz / config tz,
 # else machine local), and every printed time carries that zone (e.g. "... 10:07:18 UTC+08:00").
 # The server has no time-window query, so the CLI locates the pages that can
 # match (binary search) and filters locally.
+# No event matches: text mode prints `no matching events`, --json prints [].
 oray-tools wakeup plug timer list <sn>                    # list timers
 oray-tools wakeup plug timer add <sn> --time 08:00 --action 1 --repeat 31  # LOCAL 08:00, Mon-Fri (bit0=Mon..bit6=Sun, 0=once); minutes also accepted (--time 480); plug stores UTC, tool converts
 oray-tools wakeup plug timer remove <sn> <timer-id>
@@ -274,7 +292,9 @@ to print the full request/response exchange (method, URL, headers, request and
 response bodies) on stderr. Sensitive values are masked by default; add
 `--trace-raw` to see them verbatim. Add `--refresh-on-expired` to any
 `wakeup`/`remote` command to auto-refresh the access token and retry once
-when the server reports `TOKEN_EXPIRED`.
+when the server reports `TOKEN_EXPIRED` or answers with a bare HTTP 401;
+the detection is exact, so an unrelated business error containing `1010`
+(`sn=1010… not found`) does not cause a pointless refresh.
 
 `oray-tools <COMMAND> --help` shows command-specific options.
 
@@ -292,6 +312,43 @@ $ oray-tools wakeup list --json
       "outletcount": 1
     }
   ]
+}
+```
+
+### Machine-readable output (`--json`)
+
+The contract, identical in every command group:
+
+- On success stdout carries **exactly one** JSON value — one object (or the
+  arrays listed below) — and nothing else: human text, prompts and
+  `--verbose`/`--trace-raw` traces all go to stderr.
+- On failure the behaviour is the same with and without `--json`: a single
+  `error: ...` line on **stderr** and exit code 1. No branch swallows an
+  error just because `--json` was passed, and no success prints an empty
+  stdout.
+- Mutating commands answer with `{"ok": true, ...}` plus the target
+  (`sn` or `id` and the fields of the change): `wakeup rename|memo`,
+  `wakeup plug on|off` (`status`), `wakeup plug led` (`led`),
+  `wakeup plug power-on-restore` (`state`),
+  `wakeup plug countdown start|stop`, `wakeup plug timer remove`
+  (`timer_id`), `wakeup plug timer enable|disable` (`timer_id`, `enabled`),
+  and the auth mutations (`auth login`, `auth login-sms`, `auth refresh`,
+  `auth logout`).
+- Shapes that already existed are unchanged: `plug status`, the `logs`
+  array, the `timer list` array, `timer add`, `countdown status`,
+  `wakeup list`/`info`, `remote list`/`info`/`status` and `auth status` —
+  whose JSON never contains a token (`--show` only affects the text mode).
+- `wakeup plug timer remove|enable|disable` now fail in **both** modes when
+  the timer id is unknown (`error: ...`, exit 1); with `--json` an older
+  build exited 0 or printed nothing there.
+
+```
+$ oray-tools wakeup plug on 100000000001 --json
+{
+  "index": 0,
+  "ok": true,
+  "sn": "100000000001",
+  "status": "on"
 }
 ```
 
@@ -327,8 +384,18 @@ refresh_expires = ...
 tz = "+08:00"
 ```
 
-Use `--config <path>` to point at a different file and `--clientid <id>` to
-override the trusted client ID for a single run. `--tz <offset>` overrides the
+The config file holds credentials (`password_md5` and `refresh_token`), so
+it is written `0600` (readable and writable by its owner only) and always
+saved atomically: the bytes go to a temporary file in the same directory,
+which is then `rename`d over the target — a reader never sees a half-written
+config, and no temporary file is left behind. Treat the file as a secret and
+do not share it.
+
+Use `--config <path>` to point at a different file. `--clientid <id>`
+overrides the trusted Ex-ClientId of this run on **any** command — no longer
+only on `auth` — with the same semantics as `auth login --clientid`: the
+value is used for every request of the run and written into the config by
+the next save (login, logout, refresh, …). `--tz <offset>` overrides the
 timezone for a single run and accepts the same formats as the config value
 (e.g. `--tz +8h`, `--tz -05:30`, or `--tz +480min`).
 
@@ -364,3 +431,25 @@ Dependencies flow one way only: `oray-cli → oray-core`. Build locally with
 `cargo build` (the workspace `default-members` builds only the CLI).
 Cross-compilation for the published targets (Termux/Debian/Windows) happens
 in the release workflow.
+
+Local quality gate, from the repository root:
+
+```
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+Run `cargo test --workspace`, not a plain `cargo test`: the workspace
+`default-members` only list `crates/oray-cli`, so plain `cargo test` silently
+skips the `oray-core` unit tests and the `crates/oray-core/tests/purity.rs`
+architecture guard (which fails when interaction primitives show up in the
+core).
+
+CI runs exactly these three gates over the whole workspace on every push and
+pull request (`.github/workflows/ci.yml`), so a green local run matches the
+pipeline.
+
+Versioning has a single source: `flake.nix` reads the package version from
+`Cargo.toml` (`workspace.package.version`), so a release only needs the
+version bumped in `Cargo.toml`.
