@@ -1,4 +1,4 @@
-use crate::trace::{self, RawResult, RequestLog, TracedError, TracedResult};
+use crate::trace::{self, TracedResult};
 use crate::{Error, Result};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -239,30 +239,6 @@ impl PlugApi {
         }
     }
 
-    fn bearer_headers(&self, token: &str) -> Vec<(String, String)> {
-        vec![
-            ("Authorization".into(), format!("Bearer {token}")),
-            ("Accept".into(), "application/json".into()),
-            ("User-Agent".into(), crate::USER_AGENT.into()),
-            ("X-Channel".into(), "OPPO".into()),
-            ("Country-Region".into(), "CN".into()),
-        ]
-    }
-
-    fn ok_2xx(&self, ex: trace::Exchange) -> RawResult<(Vec<RequestLog>, String)> {
-        if !(200..300).contains(&ex.status) {
-            return Err(TracedError {
-                error: Error::HttpStatus {
-                    what: "plug request",
-                    status: ex.status,
-                    body: ex.text,
-                },
-                calls: vec![ex.log],
-            });
-        }
-        Ok((vec![ex.log], ex.text))
-    }
-
     /// Shared entry for the `GET /plug?_api=...` endpoints: build the url from `params`,
     /// run the request, parse the body into `T`, and accept only the endpoint's `ok` codes.
     fn call<T: serde::de::DeserializeOwned>(
@@ -277,11 +253,11 @@ impl PlugApi {
             trace::Request {
                 method: "GET",
                 url: plug_url(&self.slapi_base, params)?,
-                headers: self.bearer_headers(token),
+                headers: trace::api_headers(token),
                 body: None,
             },
         )?;
-        let (calls, text) = self.ok_2xx(ex)?;
+        let (calls, text) = trace::expect_2xx(ex, "plug request")?;
         let parsed = parse_json::<T>(&text).and_then(|data| {
             let env: Envelope = parse_json(&text)?;
             check_result(what, env.result, env.message.as_deref(), ok)?;
@@ -300,7 +276,7 @@ impl PlugApi {
         what: &'static str,
     ) -> TracedResult<SlResp<T>> {
         let ct = "application/x-www-form-urlencoded";
-        let mut headers = self.bearer_headers(token);
+        let mut headers = trace::api_headers(token);
         headers.push(("Content-Type".into(), ct.into()));
         let ex = trace::execute(
             &self.client,
@@ -311,7 +287,7 @@ impl PlugApi {
                 body: Some(encode_form(form)),
             },
         )?;
-        let (calls, text) = self.ok_2xx(ex)?;
+        let (calls, text) = trace::expect_2xx(ex, "plug request")?;
         let parsed = parse_json::<SlResp<T>>(&text).and_then(|parsed| {
             check_result(what, parsed.code, parsed.message.as_deref(), &[0])?;
             Ok(parsed)

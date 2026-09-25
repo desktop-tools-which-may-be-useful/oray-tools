@@ -228,22 +228,10 @@ impl AuthApi {
     }
 
     /// Check a response that should be `2xx` with no payload, carrying its
-    /// exchange on both paths.
+    /// exchange on both paths (the gate itself lives in `trace::expect_2xx`).
     fn expect_ok(ex: Exchange, what: &'static str) -> TracedResult<()> {
-        if !(200..300).contains(&ex.status) {
-            return Err(TracedError {
-                error: Error::HttpStatus {
-                    what,
-                    status: ex.status,
-                    body: ex.text,
-                },
-                calls: vec![ex.log],
-            });
-        }
-        Ok(Traced {
-            data: (),
-            calls: vec![ex.log],
-        })
+        let (calls, _) = trace::expect_2xx(ex, what)?;
+        Ok(Traced { data: (), calls })
     }
 
     /// Authenticate with `password` already md5-hashed (hex, lowercase).
@@ -289,27 +277,13 @@ impl AuthApi {
                 calls: vec![ex.log],
             });
         }
-        if !(200..300).contains(&ex.status) {
-            return Err(TracedError {
-                error: Error::HttpStatus {
-                    what,
-                    status: ex.status,
-                    body: ex.text,
-                },
-                calls: vec![ex.log],
-            });
-        }
-        match serde_json::from_str::<AuthResponse>(&ex.text)
-            .map_err(|e| Error::bad_body(ex.text, e))
-        {
+        let (calls, text) = trace::expect_2xx(ex, what)?;
+        match serde_json::from_str::<AuthResponse>(&text).map_err(|e| Error::bad_body(text, e)) {
             Ok(tokens) => Ok(Traced {
                 data: LoginOutcome::Tokens(tokens),
-                calls: vec![ex.log],
+                calls,
             }),
-            Err(error) => Err(TracedError {
-                error,
-                calls: vec![ex.log],
-            }),
+            Err(error) => Err(TracedError { error, calls }),
         }
     }
 
@@ -329,28 +303,11 @@ impl AuthApi {
         let body = send_login_code_body(mobile, timestamp, captcha_token);
         let url = format!("{}{SECCODE_MOBILE_PATH}", self.shield_base);
         let ex = self.send_shield("POST", &url, Some(body))?;
-        if !(200..300).contains(&ex.status) {
-            return Err(TracedError {
-                error: Error::HttpStatus {
-                    what: "send sms code",
-                    status: ex.status,
-                    body: ex.text,
-                },
-                calls: vec![ex.log],
-            });
-        }
-        match serde_json::from_str::<SendCodeResponse>(&ex.text)
-            .map_err(|e| Error::bad_body(ex.text, e))
-        {
-            Ok(sent) => Ok(Traced {
-                data: sent,
-                calls: vec![ex.log],
-            }),
-            Err(error) => Err(TracedError {
-                error,
-                calls: vec![ex.log],
-            }),
-        }
+        let (calls, text) = trace::expect_2xx(ex, "send sms code")?;
+        trace::finish(
+            calls,
+            serde_json::from_str::<SendCodeResponse>(&text).map_err(|e| Error::bad_body(text, e)),
+        )
     }
 
     /// Exchange an SMS login code for tokens (`type: securecode`).
@@ -414,28 +371,11 @@ impl AuthApi {
         let url = format!("{}/authorize/refreshing", self.api_base);
         let body = json!({ "refresh_token": refresh_token }).to_string();
         let ex = self.send(clientid, "POST", &url, Some(access_token), Some(body))?;
-        if !(200..300).contains(&ex.status) {
-            return Err(TracedError {
-                error: Error::HttpStatus {
-                    what: "refresh",
-                    status: ex.status,
-                    body: ex.text,
-                },
-                calls: vec![ex.log],
-            });
-        }
-        match serde_json::from_str::<AuthResponse>(&ex.text)
-            .map_err(|e| Error::bad_body(ex.text, e))
-        {
-            Ok(tokens) => Ok(Traced {
-                data: tokens,
-                calls: vec![ex.log],
-            }),
-            Err(error) => Err(TracedError {
-                error,
-                calls: vec![ex.log],
-            }),
-        }
+        let (calls, text) = trace::expect_2xx(ex, "refresh")?;
+        trace::finish(
+            calls,
+            serde_json::from_str::<AuthResponse>(&text).map_err(|e| Error::bad_body(text, e)),
+        )
     }
 }
 
