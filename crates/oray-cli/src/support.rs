@@ -100,10 +100,38 @@ pub fn traced<T>(label: &str, r: TracedResult<T>) -> Result<T> {
     }
 }
 
-/// Print a value as pretty JSON when `json` is set.
+/// Wrap a success payload in the uniform `--json` envelope: **one object**,
+/// `{"ok": true, "data": <payload>}` — `ok` at the top level, the command's
+/// own payload under the one reserved `data` key.
+///
+/// Wrapped rather than merged flat into the top level, deliberately:
+///
+/// * objects and arrays are wrapped by the **same** rule, so a consumer (and
+///   a future web API layer) unwraps exactly once — `if (!r.ok) use(r.error);
+///   use(r.data)` — with no per-command knowledge. A flat envelope cannot say
+///   that: `plug logs` / `timer list` return bare arrays, which have no room
+///   for a sibling `ok`, and would each need their own payload key name.
+/// * the envelope's keys are *reserved* instead of merely *conventional*: a
+///   payload field called `ok` (or anything else) can never collide with it,
+///   and the envelope has room to grow (`warnings`, `traces`, …) without
+///   checking every payload first.
+///
+/// The inverse is the failure body main.rs prints, `{"ok": false, "error":
+/// …}`: `data` and `error` are mutually exclusive.
+///
+/// `ok` is inserted here and nowhere else — payload builders carry only their
+/// own fields.
+pub fn envelope(payload: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "ok": true, "data": payload })
+}
+
+/// Print a value as pretty JSON when `json` is set, always through the
+/// uniform success envelope ([`envelope`]) — the single place every `--json`
+/// success document gets its `ok: true` and its `data` key.
 pub fn emit_json(json: bool, value: &impl Serialize) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(value)?);
+        let body = envelope(serde_json::to_value(value)?);
+        println!("{}", serde_json::to_string_pretty(&body)?);
     }
     Ok(())
 }
@@ -729,5 +757,50 @@ mod tests {
         let day = resolve_time_bound_tz("2026-09-01", true, now, Some(480)).unwrap();
         let day_utc = resolve_time_bound_tz("2026-09-01 00:00:00", true, now, Some(0)).unwrap();
         assert_eq!(day - day_utc, -480 * 60);
+    }
+
+    /// One envelope for every command: `{"ok": true, "data": <payload>}`, the
+    /// same rule for objects and arrays — which is why `plug logs` and
+    /// `timer list` need no payload key of their own.
+    #[test]
+    fn envelope_wraps_objects_and_arrays_alike() {
+        assert_eq!(
+            envelope(serde_json::json!({ "sn": "100000000001", "name": "desk plug" })),
+            serde_json::json!({
+                "ok": true,
+                "data": { "sn": "100000000001", "name": "desk plug" }
+            })
+        );
+        assert_eq!(
+            envelope(serde_json::json!([{ "event": "on" }, { "event": "off" }])),
+            serde_json::json!({
+                "ok": true,
+                "data": [{ "event": "on" }, { "event": "off" }]
+            })
+        );
+        // A command with nothing to report, and an empty (but successful)
+        // log window, are both still the full envelope.
+        assert_eq!(
+            envelope(serde_json::json!({})),
+            serde_json::json!({ "ok": true, "data": {} })
+        );
+        assert_eq!(
+            envelope(serde_json::json!([])),
+            serde_json::json!({ "ok": true, "data": [] })
+        );
+    }
+
+    /// The envelope's keys are *reserved*, not merged into the payload's own
+    /// level: a payload field with the same name cannot shadow `ok`, and is
+    /// still reachable under `data`.
+    #[test]
+    fn envelope_keys_cannot_collide_with_a_payload_field() {
+        assert_eq!(
+            envelope(serde_json::json!({ "ok": false, "error": "inner" })),
+            serde_json::json!({
+                "ok": true,
+                "data": { "ok": false, "error": "inner" }
+            })
+        );
     }
 }

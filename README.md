@@ -30,9 +30,9 @@ every device list/info/status is fetched live from the cloud on each command.
 - `remote` — **远程设备** (PCs / phones), from `/remotes`:
   - `list`, `info <id>`, `status <id>`, `rename`, `memo`
 - Machine-readable output: every command accepts `--json` — exactly one JSON
-  value on stdout when it succeeds, exactly one
-  `{"ok": false, "error": "..."}` object on stdout (exit code 1) when it
-  fails (see [Machine-readable output](#machine-readable-output---json))
+  object on stdout, the same envelope everywhere: `{"ok": true, "data": ...}`
+  when it succeeds, `{"ok": false, "error": "..."}` on stdout (exit code 1)
+  when it fails (see [Machine-readable output](#machine-readable-output---json))
 - Debug output: every command accepts `--verbose` (full request/response
   detail on stderr: method, URL, headers, request/response body). Sensitive
   values are masked by default; add `--trace-raw` to `--verbose` to see them
@@ -275,7 +275,8 @@ oray-tools wakeup plug logs <sn> [--index N] [--since 2h] [--until 6h] [--page N
 # else machine local), and every printed time carries that zone (e.g. "... 10:07:18 UTC+08:00").
 # The server has no time-window query, so the CLI locates the pages that can
 # match (binary search) and filters locally.
-# No event matches: text mode prints `no matching events`, --json prints [].
+# No event matches: text mode prints `no matching events`, --json prints
+# {"ok": true, "data": []}.
 oray-tools wakeup plug timer list <sn>                    # list timers
 oray-tools wakeup plug timer add <sn> --time 08:00 --action 1 --repeat 31  # LOCAL 08:00, Mon-Fri (bit0=Mon..bit6=Sun, 0=once); minutes also accepted (--time 480); plug stores UTC, tool converts
 oray-tools wakeup plug timer remove <sn> <timer-id>
@@ -332,15 +333,18 @@ Example:
 ```
 $ oray-tools wakeup list --json
 {
-  "devices": [
-    {
-      "device_id": 900001,
-      "sn": "100000000001",
-      "name": "Demo Smart Plug",
-      "device_type": "sl_smartplug",
-      "outletcount": 1
-    }
-  ]
+  "data": {
+    "devices": [
+      {
+        "device_id": 900001,
+        "sn": "100000000001",
+        "name": "Demo Smart Plug",
+        "device_type": "sl_smartplug",
+        "outletcount": 1
+      }
+    ]
+  },
+  "ok": true
 }
 ```
 
@@ -348,9 +352,15 @@ $ oray-tools wakeup list --json
 
 The contract, identical in every command group:
 
-- On success stdout carries **exactly one** JSON value — one object (or the
-  arrays listed below) — and nothing else: human text, prompts and
-  `--verbose`/`--trace-raw` traces all go to stderr.
+- On success stdout carries **exactly one** JSON object — the same envelope
+  for every command: `{"ok": true, "data": <payload>}`. `ok` is the only
+  top-level success marker and the command's own payload always sits under
+  `data`, so a consumer unwraps exactly once whatever the command was. Arrays
+  are no exception: `plug logs` and `timer list` put their array under `data`
+  too. Nothing else goes to stdout: human text, prompts and
+  `--verbose`/`--trace-raw` traces all go to stderr. (Object keys are emitted
+  in sorted order, so a real document prints `data` before `ok` — order
+  carries no meaning.)
 - On failure the exit code is 1 in both modes, and the message text is the
   same, but the channel differs by design: with `--json`, stdout carries
   exactly one object `{"ok": false, "error": "<message>"}` and the
@@ -360,22 +370,14 @@ The contract, identical in every command group:
   behaviour is unchanged: a single `error: ...` line on **stderr**. (Other
   diagnostics — prompts, `--verbose` traces, warnings — stay on stderr in
   both modes.) No branch swallows an error just because `--json` was
-  passed, and no success prints an empty stdout.
-- Mutating commands answer with `{"ok": true, ...}` plus the target
-  (`sn` or `id` and the fields of the change): `wakeup rename|memo`,
-  `wakeup plug on|off` (`status`), `wakeup plug led` (`led`),
-  `wakeup plug power-on-restore` (`state`),
-  `wakeup plug countdown start|stop`, `wakeup plug timer remove`
-  (`timer_id`), `wakeup plug timer enable|disable` (`timer_id`,
-  `enabled`), and the auth mutations (`auth login`, `auth login-sms`,
-  `auth refresh`, `auth logout`).
-- Shapes that already existed keep their keys: `plug status`, the `logs`
-  array, the `timer list` array, `timer add`, `countdown status`,
-  `wakeup list`/`info`, `remote list`/`info`/`status` and `auth status` —
-  whose JSON never contains a token (`--show` only affects the text mode).
-  The one deliberate addition is `timer enable|disable`, which gained the
-  `ok` key above: additive, so a consumer that ignores unknown keys keeps
-  working.
+  passed, and no success prints an empty stdout. `data` and `error` never
+  appear together: `ok` says which one is there.
+- The payload's own keys are unchanged (the target plus the fields of the
+  change for the mutating commands — `sn`/`id`, `status`, `led`, `state`,
+  `timer_id`, `enabled`, … — and `devices`, `remotes`, `timer add`'s
+  `SetResp`, `countdown status`, … for the read-only ones), so reading one
+  stays `wakeup list --json | jq '.data.devices[].sn'`. `auth status` still
+  never contains a token (`--show` only affects the text mode).
 - `wakeup plug timer remove|enable|disable` now fail in **both** modes when
   the timer id is unknown (`error: ...`, exit 1); with `--json` an older
   build exited 0 or printed nothing there.
@@ -383,10 +385,12 @@ The contract, identical in every command group:
 ```
 $ oray-tools wakeup plug on 100000000001 --json
 {
-  "index": 0,
-  "ok": true,
-  "sn": "100000000001",
-  "status": "on"
+  "data": {
+    "index": 0,
+    "sn": "100000000001",
+    "status": "on"
+  },
+  "ok": true
 }
 ```
 

@@ -156,6 +156,11 @@ fn resolve(base: clap::Command, argv: &[OsString]) -> Result<Cli, clap::Error> {
 /// without spawning the binary — and the single source of truth for what a
 /// `--json` consumer sees when a command fails (stdout was empty before, and
 /// the error only existed as prose on stderr).
+///
+/// Together with `support::envelope` this is the whole contract: exactly one
+/// object per run, `{"ok": true, "data": …}` on success and
+/// `{"ok": false, "error": …}` on failure — `ok` decides, and `data` and
+/// `error` never appear together.
 fn json_error_body(message: &str) -> String {
     serde_json::json!({ "ok": false, "error": message }).to_string()
 }
@@ -317,6 +322,15 @@ mod tests {
         // Quote characters stay escaped inside the JSON string.
         let quoted = json_error_body(r#"he said "no""#);
         assert!(quoted.contains(r#"he said \"no\""#), "{quoted}");
+
+        // The two halves of the contract are disjoint: success carries `data`
+        // and no `error`, failure carries `error` and no `data`, and `ok` is
+        // what tells them apart.
+        let success = support::envelope(serde_json::json!({ "account": "demo" }));
+        assert_eq!(success["ok"], true);
+        assert_eq!(success["data"]["account"], "demo");
+        assert!(success.get("error").is_none(), "{success}");
+        assert!(parsed.get("data").is_none(), "{parsed}");
     }
 
     #[test]

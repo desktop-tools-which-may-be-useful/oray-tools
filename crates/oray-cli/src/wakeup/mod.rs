@@ -6,10 +6,15 @@
 //! # `--json` output contract
 //!
 //! - With `--json`, every command prints **exactly one** JSON value on
-//!   stdout: on success an object (`rename`, `memo`) or one of the shapes
-//!   that already existed and stay untouched (`list`, `info`, plus
-//!   everything the [`plug`] submodule emits); on failure exactly one error
-//!   object (next bullet).
+//!   stdout, and every success value is the same envelope:
+//!   `{"ok": true, "data": <payload>}` — built in one place
+//!   (`support::envelope`), so `ok` is always the top-level success marker
+//!   and the command's own payload always sits under `data`: the mutating
+//!   commands' objects (`rename`, `memo`) and the listing/API shapes passed
+//!   through (`list`, `info`, plus everything the [`plug`] submodule emits)
+//!   are wrapped by the same rule. The payload builders below therefore carry
+//!   only their own fields — none of them adds `ok` itself.
+//! - On failure exactly one error object (next bullet).
 //! - A failure always `bail!`s: with `--json`, main.rs prints
 //!   `{"ok": false, "error": "<message>"}` on **stdout** — one object
 //!   carrying the very message the text mode prints — and exits 1, so a
@@ -71,15 +76,16 @@ pub enum WakeupCmd {
 /// The prompt label shared by every `<SN>` argument.
 pub(crate) const SN_LABEL: &str = "Device serial number (SN)";
 
-/// `--json` body of `wakeup rename` (module docs carry the contract). Kept as
-/// a builder so the shape is unit-testable without a network round trip.
+/// Payload of `wakeup rename` (module docs carry the contract; the envelope
+/// adds `ok` and `data`). Kept as a builder so the shape is unit-testable
+/// without a network round trip.
 fn json_renamed(sn: &str, name: &str) -> serde_json::Value {
-    serde_json::json!({ "ok": true, "sn": sn, "name": name })
+    serde_json::json!({ "sn": sn, "name": name })
 }
 
-/// `--json` body of `wakeup memo`.
+/// Payload of `wakeup memo`.
 fn json_memo(sn: &str, memo: &str) -> serde_json::Value {
-    serde_json::json!({ "ok": true, "sn": sn, "memo": memo })
+    serde_json::json!({ "sn": sn, "memo": memo })
 }
 
 /// Post-hoc page warnings for `wakeup list`, printed on **stderr** so the
@@ -258,17 +264,21 @@ fn print_wakeup_device(d: &WakeupDevice, json: bool) {
 mod tests {
     use super::*;
 
-    /// The serialized body (the exact value `emit_json` prints) of a
-    /// constructed JSON value.
+    /// The exact document `emit_json` prints for a payload: the uniform
+    /// success envelope (built in `support::envelope`, the single place `ok`
+    /// and `data` come from) around the command's own fields.
     fn body(v: serde_json::Value) -> serde_json::Value {
-        serde_json::to_value(&v).expect("JSON body serializes")
+        crate::support::envelope(v)
     }
 
     #[test]
     fn json_shape_rename() {
         assert_eq!(
             body(json_renamed("100000000001", "desk plug")),
-            serde_json::json!({ "ok": true, "sn": "100000000001", "name": "desk plug" })
+            serde_json::json!({
+                "ok": true,
+                "data": { "sn": "100000000001", "name": "desk plug" }
+            })
         );
     }
 
@@ -276,7 +286,10 @@ mod tests {
     fn json_shape_memo() {
         assert_eq!(
             body(json_memo("100000000001", "阳台")),
-            serde_json::json!({ "ok": true, "sn": "100000000001", "memo": "阳台" })
+            serde_json::json!({
+                "ok": true,
+                "data": { "sn": "100000000001", "memo": "阳台" }
+            })
         );
     }
 

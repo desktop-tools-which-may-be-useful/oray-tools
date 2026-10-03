@@ -6,9 +6,15 @@
 //! # `--json` output contract
 //!
 //! - With `--json`, every command prints **exactly one** JSON value on
-//!   stdout: on success an object (`rename`, `memo`) or one of the shapes
-//!   that already existed and stay untouched (`list`, `info`, `status`);
-//!   on failure exactly one error object (next bullet).
+//!   stdout, and every success value is the same envelope:
+//!   `{"ok": true, "data": <payload>}` — built in one place
+//!   (`support::envelope`), so `ok` is always the top-level success marker
+//!   and the command's own payload always sits under `data`: the mutating
+//!   commands' objects (`rename`, `memo`) and the shapes passed through
+//!   (`list`, `info`, `status`) are wrapped by the same rule. The payload
+//!   builders below therefore carry only their own fields — none of them adds
+//!   `ok` itself.
+//! - On failure exactly one error object (next bullet).
 //! - A failure always `bail!`s: with `--json`, main.rs prints
 //!   `{"ok": false, "error": "<message>"}` on **stdout** — one object
 //!   carrying the very message the text mode prints — and exits 1, so a
@@ -65,15 +71,16 @@ pub enum RemoteCmd {
     },
 }
 
-/// `--json` body of `remote rename` (module docs carry the contract). Kept as
-/// a builder so the shape is unit-testable without a network round trip.
+/// Payload of `remote rename` (module docs carry the contract; the envelope
+/// adds `ok` and `data`). Kept as a builder so the shape is unit-testable
+/// without a network round trip.
 fn json_renamed(id: u64, name: &str) -> serde_json::Value {
-    serde_json::json!({ "ok": true, "id": id, "name": name })
+    serde_json::json!({ "id": id, "name": name })
 }
 
-/// `--json` body of `remote memo`.
+/// Payload of `remote memo`.
 fn json_memo(id: u64, memo: &str) -> serde_json::Value {
-    serde_json::json!({ "ok": true, "id": id, "memo": memo })
+    serde_json::json!({ "id": id, "memo": memo })
 }
 
 /// Post-hoc page warnings for `remote list`, printed on **stderr** so the
@@ -313,17 +320,21 @@ pub fn run(
 mod tests {
     use super::*;
 
-    /// The serialized body (the exact value `emit_json` prints) of a
-    /// constructed JSON value.
+    /// The exact document `emit_json` prints for a payload: the uniform
+    /// success envelope (built in `support::envelope`, the single place `ok`
+    /// and `data` come from) around the command's own fields.
     fn body(v: serde_json::Value) -> serde_json::Value {
-        serde_json::to_value(&v).expect("JSON body serializes")
+        crate::support::envelope(v)
     }
 
     #[test]
     fn json_shape_rename() {
         assert_eq!(
             body(json_renamed(42, "workstation")),
-            serde_json::json!({ "ok": true, "id": 42, "name": "workstation" })
+            serde_json::json!({
+                "ok": true,
+                "data": { "id": 42, "name": "workstation" }
+            })
         );
     }
 
@@ -331,7 +342,10 @@ mod tests {
     fn json_shape_memo() {
         assert_eq!(
             body(json_memo(42, "办公桌")),
-            serde_json::json!({ "ok": true, "id": 42, "memo": "办公桌" })
+            serde_json::json!({
+                "ok": true,
+                "data": { "id": 42, "memo": "办公桌" }
+            })
         );
     }
 

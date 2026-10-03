@@ -1,4 +1,11 @@
 //! `auth` command group: authentication management (locally stored).
+//!
+//! `--json` output follows the one contract every group shares: exactly one
+//! JSON object on stdout — on success the envelope
+//! `{"ok": true, "data": <payload>}` (`support::envelope`, the single place
+//! `ok` and `data` come from) and on failure `{"ok": false, "error": …}`
+//! (printed by main.rs). The payloads below therefore carry only their own
+//! fields.
 
 use crate::config::Config;
 use crate::prompt;
@@ -261,7 +268,7 @@ fn do_login(
     });
     cfg.save(path)?;
     if json {
-        emit_json(true, &serde_json::json!({ "ok": true, "account": account }))?;
+        emit_json(true, &serde_json::json!({ "account": account }))?;
     } else {
         println!("logged in as {account}");
     }
@@ -367,7 +374,7 @@ fn do_login_sms(
     });
     cfg.save(path)?;
     if json {
-        emit_json(true, &serde_json::json!({ "ok": true, "account": mobile }))?;
+        emit_json(true, &serde_json::json!({ "account": mobile }))?;
     } else {
         println!("logged in as {mobile}");
     }
@@ -402,7 +409,7 @@ fn do_refresh(
     if json {
         emit_json(
             true,
-            &serde_json::json!({ "ok": true, "account": cfg.account.as_ref().map(|a| a.account.clone()) }),
+            &serde_json::json!({ "account": cfg.account.as_ref().map(|a| a.account.clone()) }),
         )?;
     } else {
         println!("tokens refreshed");
@@ -434,7 +441,9 @@ fn do_logout(cfg: &mut Config, path: &PathBuf, json: bool) -> Result<()> {
     cfg.token = None;
     cfg.save(path)?;
     if json {
-        emit_json(true, &serde_json::json!({ "ok": true }))?;
+        // Nothing but success to report: the envelope still carries `data`
+        // (an empty object) so the shape never varies.
+        emit_json(true, &serde_json::json!({}))?;
     } else {
         println!("logged out");
     }

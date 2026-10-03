@@ -5,12 +5,16 @@
 //! # `--json` output contract
 //!
 //! - With `--json`, every command prints **exactly one** JSON value on
-//!   stdout: on success one object (`plug on/off`, `led`,
-//!   `power-on-restore`, `countdown start/stop`, `timer remove`,
-//!   `timer enable/disable`) or one of the shapes that already existed and
-//!   stay untouched (`plug status`, `plug logs` array, `timer list` array,
-//!   `timer add` SetResp, `countdown status`); on failure exactly one error
-//!   object (next bullet).
+//!   stdout, and every success value is the same envelope:
+//!   `{"ok": true, "data": <payload>}` — built in one place
+//!   (`support::envelope`). One rule covers the mutating commands' own
+//!   objects (`plug on/off`, `led`, `power-on-restore`,
+//!   `countdown start/stop`, `timer remove`, `timer enable/disable`), the API
+//!   shapes passed through (`plug status`, `timer add`, `countdown status`)
+//!   and the arrays (`plug logs`, `timer list`) — which is what keeps those
+//!   two arrays from needing a payload key of their own. The builders below
+//!   carry only their own fields; the envelope adds `ok` and `data`. On
+//!   failure exactly one error object (next bullet).
 //! - A failure always `bail!`s: with `--json`, main.rs prints
 //!   `{"ok": false, "error": "<message>"}` on **stdout** — one object
 //!   carrying the very message the text mode prints — and exits 1, so a
@@ -476,42 +480,37 @@ fn fill_countdown(cmd: &mut CountdownCmd) -> Result<()> {
         CountdownCmd::Stop { sn, .. } => fill_sn(sn, "oray-tools wakeup plug countdown stop <sn>"),
     }
 }
-/// `--json` bodies of the mutating plug commands (module docs carry the
-/// contract). Kept as tiny builders so the shapes are unit-testable without
-/// a network round trip.
+/// Payloads of the mutating plug commands (module docs carry the contract; the
+/// envelope adds `ok` and `data`). Kept as tiny builders so the shapes are
+/// unit-testable without a network round trip.
 fn json_plug_switch(sn: &str, index: usize, on: bool) -> serde_json::Value {
     let status = if on { "on" } else { "off" };
-    serde_json::json!({ "ok": true, "sn": sn, "index": index, "status": status })
+    serde_json::json!({ "sn": sn, "index": index, "status": status })
 }
 
 fn json_led(sn: &str, on: bool) -> serde_json::Value {
     let led = if on { "on" } else { "off" };
-    serde_json::json!({ "ok": true, "sn": sn, "led": led })
+    serde_json::json!({ "sn": sn, "led": led })
 }
 
 fn json_power_on_restore(sn: &str, state: u32) -> serde_json::Value {
-    serde_json::json!({ "ok": true, "sn": sn, "state": state })
+    serde_json::json!({ "sn": sn, "state": state })
 }
 
 fn json_countdown_start(sn: &str, index: usize, count: u64, action: u8) -> serde_json::Value {
-    serde_json::json!({ "ok": true, "sn": sn, "index": index, "count": count, "action": action })
+    serde_json::json!({ "sn": sn, "index": index, "count": count, "action": action })
 }
 
 fn json_countdown_stop(sn: &str, index: usize) -> serde_json::Value {
-    serde_json::json!({ "ok": true, "sn": sn, "index": index })
+    serde_json::json!({ "sn": sn, "index": index })
 }
 
 fn json_timer_removed(sn: &str, index: usize, id: u64) -> serde_json::Value {
-    serde_json::json!({ "ok": true, "sn": sn, "index": index, "timer_id": id })
+    serde_json::json!({ "sn": sn, "index": index, "timer_id": id })
 }
 
-/// `timer enable|disable` succeeded. Carries the uniform `ok` marker like
-/// every other mutating command — the one deliberate, documented exception to
-/// "an existing shape stays byte-identical": the added key is additive (only
-/// a `deny_unknown_fields` decoder could notice) and makes the success
-/// contract uniform for consumers.
 fn json_timer_enabled(sn: &str, index: usize, id: u64, enabled: bool) -> serde_json::Value {
-    serde_json::json!({ "ok": true, "sn": sn, "index": index, "timer_id": id, "enabled": enabled })
+    serde_json::json!({ "sn": sn, "index": index, "timer_id": id, "enabled": enabled })
 }
 
 pub fn run(
@@ -987,6 +986,14 @@ fn do_countdown(ctx: &mut Ctx, sub: CountdownCmd) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// The exact document `emit_json` prints for a payload: the uniform
+    /// success envelope (built in `support::envelope`, the single place `ok`
+    /// and `data` come from) around the command's own fields — so these tests
+    /// pin what a `--json` consumer actually receives.
+    fn body(v: serde_json::Value) -> serde_json::Value {
+        crate::support::envelope(v)
+    }
+
     #[test]
     fn time_local_to_cloud() {
         let tz = 480;
@@ -1104,67 +1111,108 @@ mod tests {
     #[test]
     fn json_shape_plug_switch_led_and_restore() {
         assert_eq!(
-            serde_json::to_value(json_plug_switch("SN1", 2, true)).unwrap(),
-            serde_json::json!({ "ok": true, "sn": "SN1", "index": 2, "status": "on" })
+            body(json_plug_switch("SN1", 2, true)),
+            serde_json::json!({
+                "ok": true,
+                "data": { "sn": "SN1", "index": 2, "status": "on" }
+            })
         );
         assert_eq!(
-            serde_json::to_value(json_plug_switch("SN1", 2, false)).unwrap(),
-            serde_json::json!({ "ok": true, "sn": "SN1", "index": 2, "status": "off" })
+            body(json_plug_switch("SN1", 2, false)),
+            serde_json::json!({
+                "ok": true,
+                "data": { "sn": "SN1", "index": 2, "status": "off" }
+            })
         );
         assert_eq!(
-            serde_json::to_value(json_led("SN1", true)).unwrap(),
-            serde_json::json!({ "ok": true, "sn": "SN1", "led": "on" })
+            body(json_led("SN1", true)),
+            serde_json::json!({
+                "ok": true,
+                "data": { "sn": "SN1", "led": "on" }
+            })
         );
         assert_eq!(
-            serde_json::to_value(json_led("SN1", false)).unwrap(),
-            serde_json::json!({ "ok": true, "sn": "SN1", "led": "off" })
+            body(json_led("SN1", false)),
+            serde_json::json!({
+                "ok": true,
+                "data": { "sn": "SN1", "led": "off" }
+            })
         );
         assert_eq!(
-            serde_json::to_value(json_power_on_restore("SN1", 0)).unwrap(),
-            serde_json::json!({ "ok": true, "sn": "SN1", "state": 0 })
+            body(json_power_on_restore("SN1", 0)),
+            serde_json::json!({
+                "ok": true,
+                "data": { "sn": "SN1", "state": 0 }
+            })
         );
         assert_eq!(
-            serde_json::to_value(json_power_on_restore("SN1", 2)).unwrap(),
-            serde_json::json!({ "ok": true, "sn": "SN1", "state": 2 })
+            body(json_power_on_restore("SN1", 2)),
+            serde_json::json!({
+                "ok": true,
+                "data": { "sn": "SN1", "state": 2 }
+            })
         );
     }
 
     #[test]
     fn json_shape_countdown_start_and_stop() {
         assert_eq!(
-            serde_json::to_value(json_countdown_start("SN1", 0, 600, 1)).unwrap(),
+            body(json_countdown_start("SN1", 0, 600, 1)),
             serde_json::json!({
-                "ok": true, "sn": "SN1", "index": 0, "count": 600, "action": 1
+                "ok": true,
+                "data": { "sn": "SN1", "index": 0, "count": 600, "action": 1 }
             })
         );
         assert_eq!(
-            serde_json::to_value(json_countdown_start("SN1", 0, 30, 0)).unwrap(),
+            body(json_countdown_start("SN1", 0, 30, 0)),
             serde_json::json!({
-                "ok": true, "sn": "SN1", "index": 0, "count": 30, "action": 0
+                "ok": true,
+                "data": { "sn": "SN1", "index": 0, "count": 30, "action": 0 }
             })
         );
         assert_eq!(
-            serde_json::to_value(json_countdown_stop("SN1", 0)).unwrap(),
-            serde_json::json!({ "ok": true, "sn": "SN1", "index": 0 })
+            body(json_countdown_stop("SN1", 0)),
+            serde_json::json!({
+                "ok": true,
+                "data": { "sn": "SN1", "index": 0 }
+            })
         );
     }
 
     #[test]
     fn json_shape_timer_remove_and_enable_disable() {
         assert_eq!(
-            serde_json::to_value(json_timer_removed("SN1", 0, 7)).unwrap(),
-            serde_json::json!({ "ok": true, "sn": "SN1", "index": 0, "timer_id": 7 })
-        );
-        assert_eq!(
-            serde_json::to_value(json_timer_enabled("SN1", 0, 7, true)).unwrap(),
+            body(json_timer_removed("SN1", 0, 7)),
             serde_json::json!({
-                "ok": true, "sn": "SN1", "index": 0, "timer_id": 7, "enabled": true
+                "ok": true,
+                "data": { "sn": "SN1", "index": 0, "timer_id": 7 }
             })
         );
         assert_eq!(
-            serde_json::to_value(json_timer_enabled("SN1", 0, 7, false)).unwrap(),
+            body(json_timer_enabled("SN1", 0, 7, true)),
             serde_json::json!({
-                "ok": true, "sn": "SN1", "index": 0, "timer_id": 7, "enabled": false
+                "ok": true,
+                "data": { "sn": "SN1", "index": 0, "timer_id": 7, "enabled": true }
+            })
+        );
+        assert_eq!(
+            body(json_timer_enabled("SN1", 0, 7, false)),
+            serde_json::json!({
+                "ok": true,
+                "data": { "sn": "SN1", "index": 0, "timer_id": 7, "enabled": false }
+            })
+        );
+    }
+
+    /// The two array-returning commands go through the very same envelope, so
+    /// a consumer never needs a per-command payload key for them.
+    #[test]
+    fn json_shape_array_payloads_use_the_same_envelope() {
+        assert_eq!(
+            body(serde_json::json!([{ "index": 0, "event": "on" }])),
+            serde_json::json!({
+                "ok": true,
+                "data": [{ "index": 0, "event": "on" }]
             })
         );
     }
