@@ -150,24 +150,84 @@ fn resolve(base: clap::Command, argv: &[OsString]) -> Result<Cli, clap::Error> {
     Cli::from_arg_matches(&strict.try_get_matches_from(argv)?)
 }
 
-/// The `--json` failure body: exactly one object on stdout carrying
-/// `ok: false` and the same message text the text mode prints as a single
-/// `error: ...` line on stderr. Pure, so the failure shape is unit-testable
-/// without spawning the binary — and the single source of truth for what a
-/// `--json` consumer sees when a command fails (stdout was empty before, and
-/// the error only existed as prose on stderr).
+/// Whether `--json` was requested, read straight from `argv` — **before** the
+/// parse, because a rejected command line is itself a failure the flag has to
+/// cover: `oray-tools --json remote info` used to print nothing on stdout and
+/// prose on stderr (exit 2), so a consumer that parses stdout got an empty
+/// document exactly when it needed the error object most.
 ///
-/// Together with `support::envelope` this is the whole contract: exactly one
-/// object per run, `{"ok": true, "data": …}` on success and
-/// `{"ok": false, "error": …}` on failure — `ok` decides, and `data` and
-/// `error` never appear together.
-fn json_error_body(message: &str) -> String {
-    serde_json::json!({ "ok": false, "error": message }).to_string()
+/// Scanned rather than parsed: `--json` is a global flag so it may sit
+/// anywhere, and a bare `--` ends the flags (after it `--json` is a value —
+/// e.g. a memo text). `--json=false` is not a request for JSON.
+fn wants_json(argv: &[OsString]) -> bool {
+    for arg in argv.iter().skip(1) {
+        match arg.to_str() {
+            Some("--") => break,
+            Some("--json") | Some("--json=true") => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Drop ANSI escape sequences (CSI: `ESC [ … <letter>`) from a rendered
+/// terminal string. clap emits SGR colour this way, and a JSON document must
+/// not carry escape codes into `jq`.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The `--json` body of a **rejected command line**, built from clap's own
+/// rendering so both modes say the same thing: the text mode's `error: `
+/// prefix is dropped (that is what `main` adds before the message, and the
+/// message is what the JSON carries), the trailing newline goes with it, and
+/// ANSI colours — which clap emits for a terminal — are stripped, because a
+/// document piped into `jq` must not carry escape codes. The `Usage:` /
+/// `For more information` block stays: it is part of what clap tells a user.
+///
+/// `--help` / `--version` never reach here: those are clap's *output* on
+/// stdout, not a failure, and stay plain text under `--json` (see
+/// [`exit_parse_error`]).
+fn usage_error_body(err: &clap::Error) -> String {
+    let rendered = strip_ansi(&err.render().to_string());
+    let message = rendered.strip_prefix("error: ").unwrap_or(&rendered);
+    support::Failure::new(support::code::USAGE, message.trim_end()).body()
+}
+
+/// A command line clap rejected: in text mode byte-for-byte what it always
+/// was (`err.exit()`), with `--json` the usual one-object failure body —
+/// `code: "usage"`, clap's message — on stdout, and clap's exit code (2) kept
+/// so a caller can still tell a rejected invocation from a failed run (1).
+fn exit_parse_error(err: clap::Error, json: bool) -> ! {
+    if !err.use_stderr() || !json {
+        err.exit();
+    }
+    println!("{}", usage_error_body(&err));
+    std::process::exit(err.exit_code());
 }
 
 fn main() {
     let argv: Vec<OsString> = std::env::args_os().collect();
-    let cli = resolve(base_command(), &argv).unwrap_or_else(|e| e.exit());
+    // Read the flag before the parse: a rejected command line is one of the
+    // failures `--json` covers (see `wants_json`).
+    let json_flag = wants_json(&argv);
+    let cli = match resolve(base_command(), &argv) {
+        Ok(cli) => cli,
+        Err(e) => exit_parse_error(e, json_flag),
+    };
     support::set_verbose(cli.verbose);
     support::set_raw_trace(cli.trace_raw);
     // Read before `cli` is moved into `run`: with `--json` the failure goes
@@ -176,11 +236,14 @@ fn main() {
     // truth for the message (no error line on stderr in JSON mode).
     let json = cli.json;
     if let Err(e) = run(cli) {
-        let message = format!("{e:#}");
+        // `{:#}` is the same text the line below prints without `error: `, so
+        // the two modes keep saying exactly the same thing — the code is what
+        // only the JSON mode gains.
+        let failure = support::Failure::from_anyhow(&e);
         if json {
-            println!("{}", json_error_body(&message));
+            println!("{}", failure.body());
         } else {
-            eprintln!("error: {message}");
+            eprintln!("error: {}", failure.message());
         }
         std::process::exit(1);
     }
@@ -299,28 +362,29 @@ mod tests {
     }
 
     /// The `--json` failure contract: stdout gets exactly one object with
-    /// `ok: false` and the very message the text mode prints after
-    /// `error: ` on stderr — so a consumer never sees an empty stdout.
+    /// `ok: false`, the machine-readable `code`, and the very message the text
+    /// mode prints after `error: ` on stderr — so a consumer never sees an
+    /// empty stdout and never has to parse the prose.
     #[test]
-    fn json_error_body_is_one_object_carries_the_message() {
+    fn failure_body_is_one_object_with_code_and_message() {
         let message = "invalid time bound '3天': use an ago duration like 30m/2h/1d";
-        let body = json_error_body(message);
+        let body = support::Failure::new(support::code::FAILED, message).body();
         // One JSON value, nothing else on the "stream".
         let parsed: serde_json::Value = serde_json::from_str(&body)
             .unwrap_or_else(|e| panic!("{body} is not a single JSON value: {e}"));
-        assert_eq!(parsed, serde_json::json!({ "ok": false, "error": message }));
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "ok": false,
+                "error": { "code": "failed", "message": message }
+            })
+        );
         assert_eq!(parsed["ok"], false);
         // The message text is carried verbatim (no `error: ` prefix, no
         // rewording), so both modes say the same thing.
-        assert_eq!(parsed["error"].as_str(), Some(message));
-        assert!(
-            parsed["error"]
-                .as_str()
-                .unwrap()
-                .starts_with("invalid time bound")
-        );
+        assert_eq!(parsed["error"]["message"].as_str(), Some(message));
         // Quote characters stay escaped inside the JSON string.
-        let quoted = json_error_body(r#"he said "no""#);
+        let quoted = support::Failure::new(support::code::FAILED, r#"he said "no""#).body();
         assert!(quoted.contains(r#"he said \"no\""#), "{quoted}");
 
         // The two halves of the contract are disjoint: success carries `data`
@@ -331,6 +395,75 @@ mod tests {
         assert_eq!(success["data"]["account"], "demo");
         assert!(success.get("error").is_none(), "{success}");
         assert!(parsed.get("data").is_none(), "{parsed}");
+    }
+
+    /// `--json` is read from `argv` **before** the parse, because clap itself
+    /// rejects the command line: without this, a usage error in JSON mode left
+    /// stdout empty and a consumer got nothing to parse.
+    #[test]
+    fn wants_json_is_scanned_from_argv() {
+        assert!(wants_json(&argv(&["--json", "remote", "info"])));
+        assert!(wants_json(&argv(&["remote", "info", "--json"])));
+        assert!(wants_json(&argv(&["--json=true", "wakeup", "list"])));
+        assert!(!wants_json(&argv(&["remote", "info"])));
+        // `--json=false` asks for text; after a bare `--` the token is a value
+        // (a memo text, say), not a flag.
+        assert!(!wants_json(&argv(&["--json=false", "wakeup", "list"])));
+        assert!(!wants_json(&argv(&[
+            "wakeup", "memo", "SN", "--", "--json"
+        ])));
+        assert!(!wants_json(&argv(&[])));
+    }
+
+    /// A rejected command line is a `--json` failure too: `code: "usage"`,
+    /// clap's own message (minus the `error: ` prefix the text mode adds, and
+    /// minus ANSI colour), and clap's exit code — a rejected invocation stays
+    /// distinguishable from a failed run (1).
+    #[test]
+    fn usage_error_body_is_a_usage_failure() {
+        let err = parse_err(&["auth", "login"]);
+        let body = usage_error_body(&err);
+        let parsed: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("{body} is not a single JSON value: {e}"));
+        assert_eq!(parsed["ok"], false);
+        assert_eq!(parsed["error"]["code"], "usage");
+        let message = parsed["error"]["message"].as_str().unwrap();
+        assert!(
+            message.starts_with("the following required arguments were not provided:"),
+            "{message}"
+        );
+        // The `Usage:` block is part of what clap tells a user: it stays.
+        assert!(message.contains("<ACCOUNT>"), "{message}");
+        assert!(
+            message.contains("Usage: oray-tools auth login"),
+            "{message}"
+        );
+        assert!(!message.starts_with("error:"), "{message}");
+        assert!(!message.contains('\u{1b}'), "{message}");
+        assert!(!message.ends_with('\n'), "{message:?}");
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    /// `--help` / `--version` are clap's *output*, not a failure: they keep
+    /// going to stdout and never turn into a JSON error document.
+    #[test]
+    fn help_and_version_are_not_failures() {
+        for args in [vec!["auth", "login", "--help"], vec!["--version"]] {
+            let err = parse_err(&args);
+            assert!(!err.use_stderr(), "{args:?} must stay on stdout");
+        }
+    }
+
+    /// A terminal gets coloured clap errors; the JSON document must not: the
+    /// escape sequences go, the text between them stays.
+    #[test]
+    fn strip_ansi_removes_colour_but_keeps_text() {
+        assert_eq!(
+            strip_ansi("\u{1b}[1m\u{1b}[31merror\u{1b}[0m: boom"),
+            "error: boom"
+        );
+        assert_eq!(strip_ansi("no escapes here"), "no escapes here");
+        assert_eq!(strip_ansi("\u{1b}[33m"), "");
     }
 
     #[test]

@@ -29,6 +29,15 @@ pub enum Error {
     /// The endpoint rejected the request (business `result != 0`).
     #[error("{0}")]
     Api(String),
+    /// The entity a lookup asked for is not in the listing the API returned
+    /// (a `RemoteApi::find` / `WakeupApi::find` miss). Distinct from
+    /// [`Error::Api`] because it is not a failure the server reported: the
+    /// call succeeded, the requested item simply is not there — so a caller
+    /// (or a future web API) can answer "not found" instead of "the API said
+    /// no". The message is the same one that used to travel in as `Api`, so
+    /// text output does not change.
+    #[error("{0}")]
+    NotFound(String),
     /// The server rejected the request because the access token has expired.
     #[error("access token expired: {0}")]
     TokenExpired(String),

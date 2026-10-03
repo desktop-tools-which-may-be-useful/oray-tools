@@ -15,13 +15,18 @@
 //!   two arrays from needing a payload key of their own. The builders below
 //!   carry only their own fields; the envelope adds `ok` and `data`. On
 //!   failure exactly one error object (next bullet).
-//! - A failure always `bail!`s: with `--json`, main.rs prints
-//!   `{"ok": false, "error": "<message>"}` on **stdout** — one object
-//!   carrying the very message the text mode prints — and exits 1, so a
-//!   consumer parsing stdout always sees exactly one value; without
-//!   `--json` the single `error: ...` line goes to stderr, byte-identical
-//!   to before. No branch swallows an error just because `--json` was
-//!   passed, and no success path prints an empty stdout in JSON mode.
+//! - A failure propagates as one error and is printed in one shape: with
+//!   `--json`, main.rs prints
+//!   `{"ok": false, "error": {"code": "<code>", "message": "<message>"}}` on
+//!   **stdout** — one object carrying the very message the text mode prints,
+//!   plus the machine-readable `code` (`usage`, `config`, `not_configured`,
+//!   `token_expired`, `http_status`, `network`, `bad_body`, `api`,
+//!   `not_found`, or `failed` for what the CLI refuses locally; see
+//!   `support::code`) — and exits 1, so a consumer parsing stdout always sees
+//!   exactly one value; without `--json` the single `error: ...` line goes to
+//!   stderr, byte-identical to before. No branch swallows an error just
+//!   because `--json` was passed, and no success path prints an empty stdout
+//!   in JSON mode.
 //! - Text-mode output is unchanged, except that an empty `logs` result now
 //!   says so (`no matching events`) instead of printing nothing.
 //!
@@ -34,8 +39,8 @@ use super::{SN_LABEL, fill_sn};
 use crate::config::Config;
 use crate::prompt;
 use crate::support::{
-    emit_json, parse_ago_secs, parse_on_off, render_ts, resolve_time_bound_tz, resolve_tz,
-    tz_label, with_token,
+    code, emit_json, fail, parse_ago_secs, parse_on_off, render_ts, resolve_time_bound_tz,
+    resolve_tz, tz_label, with_token,
 };
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -878,7 +883,10 @@ fn do_timer(ctx: &mut Ctx, sub: TimerCmd) -> Result<()> {
                     Ok(())
                 }
                 // Both modes fail the same way: `error: ...` on stderr, exit 1.
-                None => bail!("timer {id} not found on sn={sn} index={index}"),
+                None => Err(fail(
+                    code::NOT_FOUND,
+                    format!("timer {id} not found on sn={sn} index={index}"),
+                )),
             }
         }
         TimerCmd::Enable { sn, id, index } => {
@@ -902,7 +910,10 @@ fn set_timer_enabled(ctx: &mut Ctx, sn: &str, index: usize, id: u64, enabled: bo
     let found = resp.timer.into_iter().find(|t| t.timer_id == Some(id));
     let Some(t) = found else {
         // Both modes fail the same way: `error: ...` on stderr, exit 1.
-        bail!("timer {id} not found on sn={sn} index={index}");
+        return Err(fail(
+            code::NOT_FOUND,
+            format!("timer {id} not found on sn={sn} index={index}"),
+        ));
     };
     ctx.with_tok(|tok| {
         plug.timer_set(

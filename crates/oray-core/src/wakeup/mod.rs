@@ -238,7 +238,7 @@ impl WakeupApi {
                 calls,
             }),
             None => Err(TracedError {
-                error: Error::Api(find_not_found_message(sn, scanned)),
+                error: Error::NotFound(find_not_found_message(sn, scanned)),
                 calls,
             }),
         }

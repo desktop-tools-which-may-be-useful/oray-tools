@@ -1,3 +1,4 @@
+use crate::support::{code, fail};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -56,11 +57,12 @@ pub struct Config {
 
 impl Config {
     pub fn default_path() -> Result<PathBuf> {
-        let dir = dirs::config_dir()
-            .or_else(dirs::home_dir)
-            .context("cannot locate config directory")?
-            .join("oray-tools");
-        Ok(dir.join("config.toml"))
+        let dir = config_err(
+            dirs::config_dir()
+                .or_else(dirs::home_dir)
+                .context("cannot locate config directory"),
+        )?;
+        Ok(dir.join("oray-tools").join("config.toml"))
     }
 
     /// Load the config from the platform default path.
@@ -94,6 +96,14 @@ impl Config {
     /// tightening an older world-readable file along the way. Any failure
     /// removes the temporary file before the error propagates.
     pub fn save(&self, path: &PathBuf) -> Result<()> {
+        config_err(self.save_atomically(path))
+    }
+
+    /// The body of [`Config::save`], split out so that every way it can fail —
+    /// creating the directory, serializing, the temporary file, the rename —
+    /// is classified as a [`code::CONFIG`] failure in one place instead of at
+    /// each `?`.
+    fn save_atomically(&self, path: &PathBuf) -> Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)
                 .with_context(|| format!("create dir {}", dir.display()))?;
@@ -125,6 +135,10 @@ impl Config {
 /// [`Config::load_explicit`]), `false` for the platform default, where a
 /// fresh install simply has no file yet and defaults apply.
 fn load_at(path: PathBuf, explicit: bool) -> Result<(Config, PathBuf)> {
+    config_err(load_at_inner(path, explicit))
+}
+
+fn load_at_inner(path: PathBuf, explicit: bool) -> Result<(Config, PathBuf)> {
     if !path.exists() {
         if explicit {
             bail!(
@@ -139,6 +153,13 @@ fn load_at(path: PathBuf, explicit: bool) -> Result<(Config, PathBuf)> {
     let cfg: Config =
         toml::from_str(&raw).with_context(|| format!("parse config {}", path.display()))?;
     Ok((cfg, path))
+}
+
+/// Attach [`code::CONFIG`] to a failure, keeping its rendered message intact —
+/// `format!("{e:#}")` is the very text the text mode printed before, so the
+/// classification adds a code without rewording anything.
+fn config_err<T>(r: Result<T>) -> Result<T> {
+    r.map_err(|e| fail(code::CONFIG, format!("{e:#}")))
 }
 
 /// Sibling temporary file used by [`Config::save`]: the target name plus the

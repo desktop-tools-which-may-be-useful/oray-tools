@@ -31,8 +31,10 @@ every device list/info/status is fetched live from the cloud on each command.
   - `list`, `info <id>`, `status <id>`, `rename`, `memo`
 - Machine-readable output: every command accepts `--json` — exactly one JSON
   object on stdout, the same envelope everywhere: `{"ok": true, "data": ...}`
-  when it succeeds, `{"ok": false, "error": "..."}` on stdout (exit code 1)
-  when it fails (see [Machine-readable output](#machine-readable-output---json))
+  when it succeeds; `{"ok": false, "error": {"code": "...", "message": "..."}}`
+  (exit code 1) when it fails, or (exit code 2, `"code": "usage"`) when the
+  command line itself is rejected
+  (see [Machine-readable output](#machine-readable-output---json))
 - Debug output: every command accepts `--verbose` (full request/response
   detail on stderr: method, URL, headers, request/response body). Sensitive
   values are masked by default; add `--trace-raw` to `--verbose` to see them
@@ -359,11 +361,12 @@ The contract, identical in every command group:
   are no exception: `plug logs` and `timer list` put their array under `data`
   too. Nothing else goes to stdout: human text, prompts and
   `--verbose`/`--trace-raw` traces all go to stderr. (Object keys are emitted
-  in sorted order, so a real document prints `data` before `ok` — order
+  in sorted order, so a real document prints `data` before `ok`, and a
+  failure prints `code` before `http_status` before `message` — order
   carries no meaning.)
-- On failure the exit code is 1 in both modes, and the message text is the
-  same, but the channel differs by design: with `--json`, stdout carries
-  exactly one object `{"ok": false, "error": "<message>"}` and the
+- On failure the message text is the same in both modes, but the channel
+  differs by design: with `--json`, stdout carries exactly one object
+  `{"ok": false, "error": {"code": "<code>", "message": "<message>"}}` and the
   `error: ...` line is *not* also written to stderr — a consumer parsing
   stdout always finds exactly one value (success object or error object)
   instead of an empty stdout plus prose on stderr. Without `--json` the
@@ -372,6 +375,30 @@ The contract, identical in every command group:
   both modes.) No branch swallows an error just because `--json` was
   passed, and no success prints an empty stdout. `data` and `error` never
   appear together: `ok` says which one is there.
+- `error.code` is the machine-readable classification, so a consumer branches
+  on a stable string instead of parsing the message:
+
+  | `code` | meaning | typical remedy |
+  | --- | --- | --- |
+  | `usage` | clap rejected the command line (exit code **2**, nothing was sent) | fix the invocation |
+  | `config` | the config file could not be located, read, parsed or written | fix `--config` / the file |
+  | `not_configured` | no account, or no usable credential, is saved | `oray-tools auth login` |
+  | `token_expired` | the server reported the access token expired | re-login, or `--refresh-on-expired` |
+  | `http_status` | the endpoint answered non-2xx; `error.http_status` carries it | inspect the server / the request |
+  | `network` | the request never completed (connect, timeout, TLS) | retry, check connectivity |
+  | `bad_body` | HTTP 2xx, but the body could not be parsed or was unusable | report it |
+  | `api` | the endpoint reported a business error (`result` != ok) | read `message` |
+  | `not_found` | the named device / remote / timer is not in what the API listed | fix the SN / id |
+  | `failed` | everything else the CLI refused locally (a value it validates itself, a missing prerequisite, …) | read `message` |
+
+  `error.http_status` (a number, not a string) is present only for
+  `http_status`.
+- A command line the parser itself rejects is a `--json` failure too: it
+  exits **2** with `code: "usage"` on stdout, so the two kinds of failure stay
+  distinguishable from the outside — 2 means the invocation was wrong and
+  nothing was sent, 1 means the command ran and failed. `--help` and
+  `--version` are clap's *output*, not failures: they stay plain text on
+  stdout with exit code 0 in both modes.
 - The payload's own keys are unchanged (the target plus the fields of the
   change for the mutating commands — `sn`/`id`, `status`, `led`, `state`,
   `timer_id`, `enabled`, … — and `devices`, `remotes`, `timer add`'s
@@ -393,6 +420,19 @@ $ oray-tools wakeup plug on 100000000001 --json
   "ok": true
 }
 ```
+
+A failure — the same shape, `ok` false, and no `data`:
+
+```
+$ oray-tools wakeup info 000000000000 --json
+{"error":{"code":"not_found","message":"wakeup device sn=000000000000 not found among 1 devices listed (only the first 100 are scanned)"},"ok":false}
+
+$ oray-tools --json remote info
+{"error":{"code":"usage","message":"the following required arguments were not provided:\n  <ID>\n\nUsage: oray-tools remote info <ID>\n\nFor more information, try '--help'."},"ok":false}
+```
+
+(Success is pretty-printed, a failure is one compact line — both are one JSON
+value; whitespace carries no meaning to `jq`.)
 
 ## Configuration
 

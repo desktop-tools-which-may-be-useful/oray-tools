@@ -6,9 +6,10 @@
 
 use crate::config::Config;
 use anyhow::{Result, bail};
-use oray_core::trace::{RequestLog, TracedResult};
+use oray_core::trace::{RequestLog, TracedError, TracedResult};
 use reqwest::blocking::Client as HttpClient;
 use serde::Serialize;
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -83,6 +84,149 @@ pub fn emit_traces(calls: &[RequestLog]) {
     }
 }
 
+/// Machine-readable classification of a failure: the `code` of the `--json`
+/// failure object (`{"ok": false, "error": {"code": …, "message": …}}`).
+///
+/// A consumer must not have to parse the message. `code` says which *kind* of
+/// failure happened, and therefore what may help: re-authenticate
+/// ([`NOT_CONFIGURED`], [`TOKEN_EXPIRED`]), retry ([`NETWORK`]), look at the
+/// server ([`HTTP_STATUS`] carries the number, [`API`], [`BAD_BODY`]), or fix
+/// the invocation ([`USAGE`], [`CONFIG`], [`FAILED`]).
+pub mod code {
+    /// clap rejected the command line: nothing was sent, exit code is 2.
+    pub const USAGE: &str = "usage";
+    /// The config file could not be located, read, parsed or written.
+    pub const CONFIG: &str = "config";
+    /// No account, or no usable credentials left: `auth login` is required.
+    pub const NOT_CONFIGURED: &str = "not_configured";
+    /// The server reported the access token expired (`TOKEN_EXPIRED` /
+    /// `code 1010`).
+    pub const TOKEN_EXPIRED: &str = "token_expired";
+    /// The endpoint answered a non-2xx status; `error.http_status` carries it.
+    pub const HTTP_STATUS: &str = "http_status";
+    /// The request never completed: connect, timeout or TLS failure.
+    pub const NETWORK: &str = "network";
+    /// HTTP 2xx, but the body could not be parsed or was unusable.
+    pub const BAD_BODY: &str = "bad_body";
+    /// The endpoint reported a business error (`result` != ok, XML `code`).
+    pub const API: &str = "api";
+    /// The named device / remote / timer is not in what the API listed.
+    pub const NOT_FOUND: &str = "not_found";
+    /// Everything else the CLI refused locally: a value it validated itself
+    /// (`--limit 0`, `--since '3天'`), a missing prerequisite, stdin that
+    /// cannot deliver a code, ...
+    pub const FAILED: &str = "failed";
+}
+
+/// A CLI failure that knows its [`code`].
+///
+/// `Display` is exactly the message and the type carries no `source`, so
+/// `{e:#}` renders the same text as the plain `anyhow` error it replaces:
+/// attaching a code never moves a byte of the text mode. That is why the
+/// protocol errors ([`Failure::from_traced`]) can be wrapped without
+/// `TracedError`'s deliberate no-`source` rule leaking into a duplicated
+/// message.
+#[derive(Debug, Clone)]
+pub struct Failure {
+    code: &'static str,
+    message: String,
+    http_status: Option<u16>,
+}
+
+impl Failure {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Failure {
+            code,
+            message: message.into(),
+            http_status: None,
+        }
+    }
+
+    /// Classify a protocol-layer error, keeping its rendered message.
+    ///
+    /// `label` reproduces the `"{label}: {error}"` prefix the CLI used to
+    /// build with `anyhow!`; `None` is the bare error, whose `Display` already
+    /// is the inner [`oray_core::Error`]'s text.
+    pub fn from_traced(label: Option<&str>, e: &TracedError) -> Self {
+        use oray_core::Error as CoreError;
+        let (code, http_status) = match &e.error {
+            CoreError::TokenExpired(_) => (code::TOKEN_EXPIRED, None),
+            CoreError::HttpStatus { status, .. } => (code::HTTP_STATUS, Some(*status)),
+            CoreError::Http(_) => (code::NETWORK, None),
+            CoreError::BadBody { .. } => (code::BAD_BODY, None),
+            CoreError::Api(_) => (code::API, None),
+            CoreError::NotFound(_) => (code::NOT_FOUND, None),
+        };
+        let message = match label {
+            Some(label) => format!("{label}: {e}"),
+            None => e.to_string(),
+        };
+        Failure {
+            code,
+            message,
+            http_status,
+        }
+    }
+
+    /// The failure a `main`-level `anyhow::Error` stands for.
+    ///
+    /// A typed [`Failure`] anywhere in the chain lends its code — also through
+    /// a `.context(...)` layer, which anyhow downcasts through — while the
+    /// message is always the rendered `{:#}` chain, the exact text the text
+    /// mode prints. So attaching a code can never reword an error, and a
+    /// coded error that a caller wraps in extra context keeps both the code
+    /// and the longer message.
+    pub fn from_anyhow(e: &anyhow::Error) -> Self {
+        let message = format!("{e:#}");
+        match e.downcast_ref::<Failure>() {
+            Some(f) => Failure {
+                message,
+                ..f.clone()
+            },
+            None => Failure::new(code::FAILED, message),
+        }
+    }
+
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub fn http_status(&self) -> Option<u16> {
+        self.http_status
+    }
+
+    /// The `--json` failure body: exactly one compact object, the exact mirror
+    /// of the success envelope — `ok: false`, everything about the failure
+    /// under `error`, and never a `data` key.
+    pub fn body(&self) -> String {
+        let mut error = serde_json::Map::new();
+        error.insert("code".into(), self.code().into());
+        error.insert("message".into(), self.message().into());
+        if let Some(status) = self.http_status() {
+            error.insert("http_status".into(), status.into());
+        }
+        serde_json::json!({ "ok": false, "error": serde_json::Value::Object(error) }).to_string()
+    }
+}
+
+impl fmt::Display for Failure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Failure {}
+
+/// An `anyhow::Error` carrying a [`code`]: the short form for the CLI's own
+/// refusals, where the kind is known locally.
+pub fn fail(code: &'static str, message: impl Into<String>) -> anyhow::Error {
+    Failure::new(code, message).into()
+}
+
 /// Run a `TracedResult` to completion at the presentation layer: print its
 /// exchanges when `--verbose` is set, then unwrap the data or the error.
 /// Used by command paths that talk to the protocol layer directly (the auth
@@ -95,7 +239,7 @@ pub fn traced<T>(label: &str, r: TracedResult<T>) -> Result<T> {
         }
         Err(e) => {
             emit_traces(&e.calls);
-            Err(anyhow::anyhow!("{label}: {e}"))
+            Err(Failure::from_traced(Some(label), &e).into())
         }
     }
 }
@@ -116,8 +260,9 @@ pub fn traced<T>(label: &str, r: TracedResult<T>) -> Result<T> {
 ///   and the envelope has room to grow (`warnings`, `traces`, …) without
 ///   checking every payload first.
 ///
-/// The inverse is the failure body main.rs prints, `{"ok": false, "error":
-/// …}`: `data` and `error` are mutually exclusive.
+/// The inverse is the failure body main.rs prints through
+/// [`Failure::body`], `{"ok": false, "error": {"code": …, "message": …}}`:
+/// `data` and `error` are mutually exclusive.
 ///
 /// `ok` is inserted here and nowhere else — payload builders carry only their
 /// own fields.
@@ -163,13 +308,13 @@ pub fn with_token<T>(
                 }
                 Err(e) => {
                     emit_traces(&e.calls);
-                    Err(e.into())
+                    Err(Failure::from_traced(None, &e).into())
                 }
             }
         }
         Err(e) => {
             emit_traces(&e.calls);
-            Err(e.into())
+            Err(Failure::from_traced(None, &e).into())
         }
     }
 }
@@ -802,5 +947,147 @@ mod tests {
                 "data": { "ok": false, "error": "inner" }
             })
         );
+    }
+
+    /// Every protocol error gets a `code` — that is the whole point of the
+    /// typed failure: a consumer branches on the code instead of parsing
+    /// prose. The message stays the label plus the error, verbatim.
+    #[test]
+    fn every_protocol_error_gets_a_code() {
+        let cases = [
+            (
+                oray_core::Error::TokenExpired("TOKEN_EXPIRED".into()),
+                code::TOKEN_EXPIRED,
+            ),
+            (
+                oray_core::Error::HttpStatus {
+                    what: "get remotes",
+                    status: 503,
+                    body: "down".into(),
+                },
+                code::HTTP_STATUS,
+            ),
+            (
+                oray_core::Error::BadBody {
+                    body: "<html>".into(),
+                    source: serde_json::from_str::<i32>("<html>").unwrap_err(),
+                },
+                code::BAD_BODY,
+            ),
+            (
+                oray_core::Error::Api("plug get failed (code=10100)".into()),
+                code::API,
+            ),
+            (
+                oray_core::Error::NotFound("sn=1 not found".into()),
+                code::NOT_FOUND,
+            ),
+        ];
+        for (error, expected) in cases {
+            let text = error.to_string();
+            let traced = TracedError {
+                error,
+                calls: Vec::new(),
+            };
+            let failure = Failure::from_traced(Some("plug status"), &traced);
+            assert_eq!(failure.code(), expected, "{failure:?}");
+            assert_eq!(failure.message(), format!("plug status: {text}"));
+        }
+    }
+
+    /// A request reqwest cannot even build (no network involved) is a
+    /// transport failure: `network`, never a fake `api` or `http_status`.
+    #[test]
+    fn transport_failure_is_network() {
+        let client = reqwest::blocking::Client::new();
+        let Err(err) = oray_core::trace::execute(
+            &client,
+            oray_core::trace::Request {
+                method: "GET",
+                url: "http://".into(),
+                headers: Vec::new(),
+                body: None,
+            },
+        ) else {
+            panic!("a request to an unbuildable URL must fail");
+        };
+        assert!(matches!(err.error, oray_core::Error::Http(_)), "{err:?}");
+        assert_eq!(Failure::from_traced(None, &err).code(), code::NETWORK);
+    }
+
+    /// The non-2xx status travels as a number, so a consumer can tell a 401
+    /// from a 502 without reading anything; a code that has no status carries
+    /// no `http_status` key at all.
+    #[test]
+    fn http_status_number_is_carried_only_when_there_is_one() {
+        let traced = TracedError {
+            error: oray_core::Error::HttpStatus {
+                what: "get remotes",
+                status: 503,
+                body: "down".into(),
+            },
+            calls: Vec::new(),
+        };
+        let failure = Failure::from_traced(None, &traced);
+        assert_eq!(failure.http_status(), Some(503));
+        let parsed: serde_json::Value = serde_json::from_str(&failure.body()).unwrap();
+        assert_eq!(parsed["error"]["code"], "http_status");
+        assert_eq!(parsed["error"]["http_status"], 503);
+        assert!(parsed["error"]["http_status"].is_u64(), "{parsed}");
+
+        let plain = Failure::new(code::API, "boom");
+        assert_eq!(plain.http_status(), None);
+        let parsed: serde_json::Value = serde_json::from_str(&plain.body()).unwrap();
+        assert!(parsed["error"].get("http_status").is_none(), "{parsed}");
+    }
+
+    /// The code is metadata: classifying an error must not move one byte of
+    /// the text mode's message. `support::traced` used to build
+    /// `anyhow!("{label}: {e}")` and `with_token` used to convert the bare
+    /// `TracedError` — both renderings have to survive the code being attached.
+    #[test]
+    fn classifying_an_error_never_reworks_its_message() {
+        let api_error = || TracedError {
+            error: oray_core::Error::Api("plug get failed (code=10100)".into()),
+            calls: Vec::new(),
+        };
+
+        // The labelled path (`support::traced`).
+        let labelled: anyhow::Error = traced::<()>("plug status", Err(api_error())).unwrap_err();
+        assert_eq!(
+            format!("{labelled:#}"),
+            "plug status: plug get failed (code=10100)"
+        );
+        assert_eq!(Failure::from_anyhow(&labelled).code(), code::API);
+
+        // The bare path (`with_token`), whose `TracedError` deliberately has
+        // no `source`: the message is the inner error's own text.
+        let bare: anyhow::Error = Failure::from_traced(None, &api_error()).into();
+        assert_eq!(format!("{bare:#}"), "plug get failed (code=10100)");
+        assert_eq!(Failure::from_anyhow(&bare).code(), code::API);
+    }
+
+    /// A coded failure stays coded when a caller wraps it in more context, and
+    /// its message is then the longer chain — which is exactly what the text
+    /// mode printed before. Anything unclassified is honestly `failed`, not a
+    /// made-up kind.
+    #[test]
+    fn a_code_survives_anyhow_context() {
+        let err = fail(
+            code::CONFIG,
+            "parse config /etc/x.toml: missing field `api_base`",
+        )
+        .context("load config");
+        let failure = Failure::from_anyhow(&err);
+        assert_eq!(failure.code(), code::CONFIG);
+        assert_eq!(
+            failure.message(),
+            "load config: parse config /etc/x.toml: missing field `api_base`"
+        );
+
+        let plain = anyhow::anyhow!("--limit must be at least 1");
+        let failure = Failure::from_anyhow(&plain);
+        assert_eq!(failure.code(), code::FAILED);
+        assert_eq!(failure.message(), "--limit must be at least 1");
     }
 }

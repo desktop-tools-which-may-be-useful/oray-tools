@@ -3,13 +3,14 @@
 //! `--json` output follows the one contract every group shares: exactly one
 //! JSON object on stdout — on success the envelope
 //! `{"ok": true, "data": <payload>}` (`support::envelope`, the single place
-//! `ok` and `data` come from) and on failure `{"ok": false, "error": …}`
-//! (printed by main.rs). The payloads below therefore carry only their own
-//! fields.
+//! `ok` and `data` come from) and on failure
+//! `{"ok": false, "error": {"code": …, "message": …}}` (printed by main.rs,
+//! classified by `support::Failure`). The payloads below therefore carry only
+//! their own fields.
 
 use crate::config::Config;
 use crate::prompt;
-use crate::support::{emit_json, hostname, print_tokens, resolve_clientid, traced};
+use crate::support::{code, emit_json, fail, hostname, print_tokens, resolve_clientid, traced};
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use oray_core::auth::{AuthApi, LoginOutcome};
@@ -389,12 +390,18 @@ fn do_refresh(
     json: bool,
 ) -> Result<()> {
     let (access, refresh) = {
-        let token = cfg
-            .token
-            .as_ref()
-            .context("no token saved; run `oray-tools auth login` first")?;
+        let nothing_saved = || {
+            fail(
+                code::NOT_CONFIGURED,
+                "no token saved; run `oray-tools auth login` first",
+            )
+        };
+        let token = cfg.token.as_ref().ok_or_else(nothing_saved)?;
         if token.refresh_token.is_empty() {
-            bail!("no refresh token saved; run `oray-tools auth login` first");
+            return Err(fail(
+                code::NOT_CONFIGURED,
+                "no refresh token saved; run `oray-tools auth login` first",
+            ));
         }
         (token.access_token.clone(), token.refresh_token.clone())
     };

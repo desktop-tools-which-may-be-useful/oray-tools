@@ -15,13 +15,18 @@
 //!   are wrapped by the same rule. The payload builders below therefore carry
 //!   only their own fields — none of them adds `ok` itself.
 //! - On failure exactly one error object (next bullet).
-//! - A failure always `bail!`s: with `--json`, main.rs prints
-//!   `{"ok": false, "error": "<message>"}` on **stdout** — one object
-//!   carrying the very message the text mode prints — and exits 1, so a
-//!   consumer parsing stdout always sees exactly one value; without
-//!   `--json` the single `error: ...` line goes to stderr, byte-identical
-//!   to before. No branch swallows an error just because `--json` was
-//!   passed, and no success path prints an empty stdout in JSON mode.
+//! - A failure propagates as one error and is printed in one shape: with
+//!   `--json`, main.rs prints
+//!   `{"ok": false, "error": {"code": "<code>", "message": "<message>"}}` on
+//!   **stdout** — one object carrying the very message the text mode prints,
+//!   plus the machine-readable `code` (`usage`, `config`, `not_configured`,
+//!   `token_expired`, `http_status`, `network`, `bad_body`, `api`,
+//!   `not_found`, or `failed` for what the CLI refuses locally; see
+//!   `support::code`) — and exits 1, so a consumer parsing stdout always sees
+//!   exactly one value; without `--json` the single `error: ...` line goes to
+//!   stderr, byte-identical to before. No branch swallows an error just
+//!   because `--json` was passed, and no success path prints an empty stdout
+//!   in JSON mode.
 //! - Text-mode output is unchanged.
 
 pub mod plug;

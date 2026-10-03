@@ -1,5 +1,6 @@
 use crate::config::{Config, Token};
-use anyhow::{Result, bail};
+use crate::support::{code, fail};
+use anyhow::Result;
 use base64::Engine;
 use oray_core::auth::{AuthApi, AuthResponse};
 use reqwest::blocking::Client as HttpClient;
@@ -72,14 +73,20 @@ pub fn ensure_token(
     force: bool,
 ) -> Result<Token> {
     if cfg.account.is_none() {
-        bail!("no account configured; run `oray-tools auth login`");
+        return Err(fail(
+            code::NOT_CONFIGURED,
+            "no account configured; run `oray-tools auth login`",
+        ));
     }
     let current = cfg.token.clone().unwrap_or_default();
     if !force && !current.access_token.is_empty() && !is_access_expired(&current.access_token) {
         return Ok(current);
     }
     if current.refresh_token.is_empty() {
-        bail!("no valid access token and no refresh token; run `oray-tools auth login`");
+        return Err(fail(
+            code::NOT_CONFIGURED,
+            "no valid access token and no refresh token; run `oray-tools auth login`",
+        ));
     }
     let server = cfg.server();
     let api = AuthApi::new(http.clone(), &server.api_base);
@@ -124,14 +131,17 @@ pub fn validate_refresh_response(resp: &AuthResponse) -> Result<()> {
     if access_ok && refresh_ok {
         return Ok(());
     }
-    bail!(
-        "refresh returned an unusable token payload (access_token {} chars, refresh_token {} chars; \
-         expected a three-segment JWT with an `exp` claim and a refresh token of at least \
-         {MIN_REFRESH_TOKEN_LEN} chars) — the saved config was left untouched; if this keeps \
-         happening, run `oray-tools auth login`",
-        resp.access_token.len(),
-        resp.refresh_token.len()
-    );
+    Err(fail(
+        code::BAD_BODY,
+        format!(
+            "refresh returned an unusable token payload (access_token {} chars, refresh_token {} chars; \
+             expected a three-segment JWT with an `exp` claim and a refresh token of at least \
+             {MIN_REFRESH_TOKEN_LEN} chars) — the saved config was left untouched; if this keeps \
+             happening, run `oray-tools auth login`",
+            resp.access_token.len(),
+            resp.refresh_token.len()
+        ),
+    ))
 }
 
 /// Validate `resp` and persist it as the saved token, returning what was

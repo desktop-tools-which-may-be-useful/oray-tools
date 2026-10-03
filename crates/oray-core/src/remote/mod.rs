@@ -264,7 +264,7 @@ impl RemoteApi {
                 calls,
             }),
             None => Err(TracedError {
-                error: Error::Api(format!(
+                error: Error::NotFound(format!(
                     "remote {remote_id} not found among {scanned} remotes listed"
                 )),
                 calls,
